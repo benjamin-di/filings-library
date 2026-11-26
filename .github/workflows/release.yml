@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils qpdf tesseract-ocr
       - run: make bootstrap
       - run: make check
