@@ -551,6 +551,12 @@ async def test_ssrf_url_validation_redirects_sec_host_and_streaming_cap() -> Non
     with pytest.raises(UnsafeUrlError):
         validate_public_https_url("https://10.0.0.5/internal", resolver=_public_test_resolver)
     with pytest.raises(UnsafeUrlError):
+        validate_public_https_url("https://100.64.0.1/cgnat", resolver=_public_test_resolver)
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url(
+            "https://[::ffff:100.64.0.1]/cgnat6", resolver=_public_test_resolver
+        )
+    with pytest.raises(UnsafeUrlError):
         validate_public_https_url(
             "https://private.example.test/doc.pdf",
             resolver=lambda _h, _p: ["192.168.1.10"],

@@ -48,7 +48,8 @@ def _assert_public_ip(raw_ip: str, *, host: str) -> None:
 
     for candidate in candidates:
         if (
-            candidate.is_private
+            not candidate.is_global
+            or candidate.is_private
             or candidate.is_loopback
             or candidate.is_link_local
             or candidate.is_reserved

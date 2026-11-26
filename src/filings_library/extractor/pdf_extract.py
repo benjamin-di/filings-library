@@ -57,12 +57,12 @@ def _unlock_with_qpdf(
     if proc.returncode == 0 and dst.exists():
         return dst
     stderr = (proc.stderr or "") + (proc.stdout or "")
-    if _is_password_error(stderr):
-        raise EncryptedPdfError(f"PDF requires a user password: {stderr.strip()}")
     # qpdf exit code 3 is warnings-only (output still written).
     if proc.returncode == 3 and dst.exists():
         warnings.append(f"qpdf warning: {stderr.strip()}")
         return dst
+    if _is_password_error(stderr):
+        raise EncryptedPdfError(f"PDF requires a user password: {stderr.strip()}")
     warnings.append(f"qpdf unlock failed (exit {proc.returncode}); using original PDF")
     return src
 
