@@ -245,6 +245,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_data_args(p_rebuild)
     p_rebuild.add_argument("--json", action="store_true", dest="as_json")
 
+    # backup
+    p_backup = sub.add_parser("backup", help="Create a verified SQLite online backup")
+    p_backup.add_argument("out_dir", help="Destination directory for dated online backup")
+    _add_common_data_args(p_backup)
+    p_backup.add_argument("--json", action="store_true", dest="as_json")
+
     # serve
     p_serve = sub.add_parser("serve", help="Run hosted HTTP/MCP server via uvicorn")
     _add_common_data_args(p_serve)
@@ -413,6 +419,65 @@ def _cmd_rebuild_fts(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _cmd_backup(args: argparse.Namespace) -> int:
+    import hashlib
+    import shutil
+    import sqlite3
+    import tempfile
+    from datetime import UTC, datetime
+
+    data_dir = Path(args.data_dir)
+    src_db = data_dir / "filings.sqlite3"
+    if not src_db.is_file():
+        raise FileNotFoundError(f"Database not found: {src_db}")
+    out_root = Path(args.out_dir)
+    if out_root.is_symlink():
+        raise ValueError("backup out_dir must not be a symlink")
+    out_root.mkdir(parents=True, exist_ok=True)
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    final_dir = out_root / day
+    stage_dir = Path(tempfile.mkdtemp(prefix=f".backup-{day}-", dir=out_root))
+    try:
+        dst_db = stage_dir / "filings.sqlite3"
+        src_conn = sqlite3.connect(f"file:{src_db}?mode=ro", uri=True, timeout=10.0)
+        try:
+            dst_conn = sqlite3.connect(dst_db)
+            try:
+                src_conn.backup(dst_conn)
+                check = dst_conn.execute("PRAGMA quick_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise RuntimeError(f"Backup integrity check failed: {check}")
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
+        sha = hashlib.sha256(dst_db.read_bytes()).hexdigest()
+        manifest = {
+            "schema": 1,
+            "created_at": datetime.now(UTC).isoformat(),
+            "day": day,
+            "files": {"filings.sqlite3": {"sha256": sha, "bytes": dst_db.stat().st_size}},
+        }
+        (stage_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        if final_dir.exists():
+            shutil.rmtree(final_dir)
+        os.replace(stage_dir, final_dir)
+        payload = {"backup_dir": str(final_dir), "sha256": sha, "bytes": dst_db.stat().st_size}
+        _print_output(
+            payload,
+            as_json=args.as_json,
+            text_formatter=lambda d: (
+                f"Backed up SQLite DB to {d['backup_dir']} ({d['bytes']} bytes)"
+            ),
+        )
+        return 0
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     store, cas = _open_store_and_cas(args.data_dir)
     try:
@@ -447,6 +512,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": _cmd_status,
         "export-md": _cmd_export_md,
         "rebuild-fts": _cmd_rebuild_fts,
+        "backup": _cmd_backup,
         "serve": _cmd_serve,
         "extractor": _cmd_extractor,
     }

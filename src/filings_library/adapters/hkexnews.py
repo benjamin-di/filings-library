@@ -154,7 +154,11 @@ class HkexnewsAdapter:
     async def discover(
         self, company: CompanyTarget, *, today: date | None = None
     ) -> list[FilingCandidate]:
-        is_hk = bool(company.hkex_stock_id) or company.exchange.upper() in {"XHKG", "HKEX", "SEHK"}
+        is_hk = (
+            bool(company.hkex_stock_id)
+            or company.exchange.upper() in {"XHKG", "HKEX", "SEHK"}
+            or bool(re.fullmatch(r"\d{5}", company.ticker.strip()))
+        )
         if not is_hk:
             return []
 
