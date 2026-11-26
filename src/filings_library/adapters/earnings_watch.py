@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 from filings_library.adapters import FilingCandidate
 from filings_library.models import CompanyTarget, FormFamily, SourceAdapter
+from filings_library.url_safety import (
+    HostResolver,
+    UnsafeUrlError,
+    validate_public_https_url,
+)
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _ROLE_TO_FAMILY: dict[str, FormFamily] = {
     "results_release": FormFamily.RESULTS_RELEASE,
@@ -30,20 +38,40 @@ def _guess_mime(url: str) -> str:
     return "text/html"
 
 
+def _parse_iso_date(raw: str | None) -> str:
+    if not isinstance(raw, str):
+        return "undated"
+    prefix = raw.strip()[:10]
+    if not _ISO_DATE_RE.match(prefix):
+        return "undated"
+    try:
+        return date.fromisoformat(prefix).isoformat()
+    except ValueError:
+        return "undated"
+
+
 class EarningsWatchAdapter:
     """Ingests high-priority release-day `verified_documents` from `CompanyTarget`."""
+
+    def __init__(self, *, resolver: HostResolver | None = None) -> None:
+        self._resolver = resolver
 
     async def discover(
         self, company: CompanyTarget, *, today: date | None = None
     ) -> list[FilingCandidate]:
-        ref_date = (today or date.today()).isoformat()
+        del today
         candidates: list[FilingCandidate] = []
         for hint in company.verified_documents:
-            if not hint.url.strip():
+            raw_url = hint.url.strip()
+            if not raw_url:
+                continue
+            try:
+                safe_url = validate_public_https_url(raw_url, resolver=self._resolver)
+            except UnsafeUrlError:
                 continue
             role_key = (hint.role or "other").strip().lower()
             form_family = _ROLE_TO_FAMILY.get(role_key, FormFamily.RESULTS_RELEASE)
-            fdate = hint.first_seen[:10] if len(hint.first_seen) >= 10 else ref_date
+            fdate = _parse_iso_date(hint.first_seen)
             candidates.append(
                 FilingCandidate(
                     source_key=company.source_key,
@@ -54,8 +82,8 @@ class EarningsWatchAdapter:
                     title=hint.title or f"{company.name} {hint.role}",
                     filing_date=fdate,
                     period_end=None,
-                    source_url=hint.url,
-                    source_mime=_guess_mime(hint.url),
+                    source_url=safe_url,
+                    source_mime=_guess_mime(safe_url),
                     language="en",
                     refetchable=False,
                     is_amendment=False,

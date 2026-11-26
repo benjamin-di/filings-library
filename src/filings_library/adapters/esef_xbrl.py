@@ -8,6 +8,12 @@ import httpx
 
 from filings_library.adapters import FilingCandidate
 from filings_library.models import CompanyTarget, FormFamily, SourceAdapter
+from filings_library.url_safety import (
+    ESEF_ALLOWED_HOSTS,
+    HostResolver,
+    UnsafeUrlError,
+    validate_public_https_url,
+)
 
 ESEF_API_BASE = "https://filings.xbrl.org"
 ESEF_FILINGS_URL = f"{ESEF_API_BASE}/api/filings"
@@ -34,10 +40,12 @@ class EsefXbrlAdapter:
         backfill_years: int = 3,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        resolver: HostResolver | None = None,
     ) -> None:
         self._backfill_years = max(1, backfill_years)
         self._timeout = timeout
         self._transport = transport
+        self._resolver = resolver
 
     async def discover(
         self, company: CompanyTarget, *, today: date | None = None
@@ -98,6 +106,15 @@ class EsefXbrlAdapter:
             if country:
                 title = f"{title} [{country}]"
 
+            try:
+                resolved_url = validate_public_https_url(
+                    _resolve_url(report_url),
+                    allowed_hosts=ESEF_ALLOWED_HOSTS,
+                    resolver=self._resolver,
+                )
+            except UnsafeUrlError:
+                continue
+
             candidates.append(
                 FilingCandidate(
                     source_key=company.source_key,
@@ -108,7 +125,7 @@ class EsefXbrlAdapter:
                     title=title,
                     filing_date=filing_date,
                     period_end=period_end,
-                    source_url=_resolve_url(report_url),
+                    source_url=resolved_url,
                     source_mime="application/xhtml+xml"
                     if lower_url.endswith(".xhtml")
                     else "text/html",

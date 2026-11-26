@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -18,13 +20,29 @@ from filings_library.adapters.earnings_watch import EarningsWatchAdapter
 from filings_library.adapters.esef_xbrl import EsefXbrlAdapter
 from filings_library.adapters.hkexnews import HkexnewsAdapter
 from filings_library.adapters.sec_edgar import SecEdgarAdapter
-from filings_library.cas import ContentAddressedStore
-from filings_library.extractor.app import ExtractorClient
-from filings_library.models import ArtifactKind, DocumentRecord
+from filings_library.cas import ContentAddressedStore, SymlinkRejectedError
+from filings_library.extractor.app import MAX_EXTRACT_BYTES, ExtractorClient
+from filings_library.models import ArtifactKind, DocumentRecord, SourceAdapter
 from filings_library.store import DEFAULT_GLOBAL_CAP_BYTES, FilingsStore
 from filings_library.targets_client import LibraryTargetsClient
+from filings_library.url_safety import (
+    ESEF_ALLOWED_HOSTS,
+    HKEX_ALLOWED_HOSTS,
+    SEC_ALLOWED_HOSTS,
+    HostResolver,
+    validate_public_https_url,
+)
 
-_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+MAX_DOWNLOAD_REDIRECTS = 5
+
+_ADAPTER_ALLOWED_HOSTS: dict[SourceAdapter, frozenset[str] | None] = {
+    SourceAdapter.SEC_EDGAR: SEC_ALLOWED_HOSTS,
+    SourceAdapter.HKEXNEWS: HKEX_ALLOWED_HOSTS,
+    SourceAdapter.ESEF_XBRL: ESEF_ALLOWED_HOSTS,
+    SourceAdapter.EARNINGS_WATCH: None,
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +53,7 @@ class SyncConfig:
     per_issuer_max_docs: int = 200
     sec_user_agent: str | None = None
     download_timeout: float = 60.0
+    max_download_bytes: int = MAX_EXTRACT_BYTES
 
 
 @dataclass
@@ -58,27 +77,74 @@ def _filename_from_url(url: str) -> str:
     return name or "document"
 
 
+def _sanitize_path_component(value: str, *, fallback: str) -> str:
+    stripped = (value or "").strip()
+    if not stripped or stripped in {".", ".."}:
+        return fallback
+    cleaned = _SAFE_COMPONENT_RE.sub("_", stripped).strip("_")
+    if not cleaned or cleaned in {".", ".."}:
+        return fallback
+    return cleaned
+
+
 async def _download_bytes(
     url: str,
     *,
     sec_user_agent: str | None,
     transport: httpx.AsyncBaseTransport | None,
     timeout: float,
+    max_bytes: int = MAX_EXTRACT_BYTES,
+    allowed_hosts: Collection[str] | None = None,
+    resolver: HostResolver | None = None,
+    max_redirects: int = MAX_DOWNLOAD_REDIRECTS,
 ) -> tuple[bytes, str]:
-    headers: dict[str, str] = {}
-    host = (urlparse(url).hostname or "").lower()
-    if sec_user_agent and (host.endswith("sec.gov") or host == "sec.gov"):
-        headers["User-Agent"] = sec_user_agent
+    current_url = url
     async with httpx.AsyncClient(
-        headers=headers,
         transport=transport,
         timeout=timeout,
-        follow_redirects=True,
+        follow_redirects=False,
     ) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        return resp.content, content_type
+        for hop in range(max_redirects + 1):
+            validated_url = validate_public_https_url(
+                current_url,
+                allowed_hosts=allowed_hosts,
+                resolver=resolver,
+            )
+            host = (urlparse(validated_url).hostname or "").lower().rstrip(".")
+            headers: dict[str, str] = {}
+            if sec_user_agent and (host == "sec.gov" or host.endswith(".sec.gov")):
+                headers["User-Agent"] = sec_user_agent
+
+            async with client.stream("GET", validated_url, headers=headers) as resp:
+                if resp.status_code in _REDIRECT_STATUSES and "location" in resp.headers:
+                    if hop >= max_redirects:
+                        raise ValueError(f"Exceeded max redirects ({max_redirects}) for {url}")
+                    current_url = urljoin(validated_url, resp.headers["location"])
+                    continue
+
+                resp.raise_for_status()
+
+                content_length = resp.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length.strip())
+                    except ValueError:
+                        declared_size = -1
+                    if declared_size > max_bytes:
+                        raise ValueError(
+                            f"Download Content-Length {declared_size} exceeds max_bytes ({max_bytes})"
+                        )
+
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    if len(buf) + len(chunk) > max_bytes:
+                        raise ValueError(f"Download body exceeded max_bytes ({max_bytes})")
+                    buf.extend(chunk)
+
+                content_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                return bytes(buf), content_type
+
+    raise ValueError(f"Exceeded max redirects ({max_redirects}) for {url}")
 
 
 async def sync_once(
@@ -93,6 +159,7 @@ async def sync_once(
     esef_adapter: EsefXbrlAdapter | None = None,
     earnings_watch_adapter: EarningsWatchAdapter | None = None,
     download_transport: httpx.AsyncBaseTransport | None = None,
+    url_resolver: HostResolver | None = None,
     today: date | None = None,
 ) -> SyncResult:
     """Run one bounded sync pass across all companies returned by `targets_client`."""
@@ -101,19 +168,24 @@ async def sync_once(
 
     payload = await targets_client.fetch_targets()
 
-    ew = earnings_watch_adapter or EarningsWatchAdapter()
+    ew = earnings_watch_adapter or EarningsWatchAdapter(resolver=url_resolver)
     sec = sec_adapter
     if sec is None and cfg.sec_user_agent:
         sec = SecEdgarAdapter(
             user_agent=cfg.sec_user_agent,
             backfill_years=cfg.backfill_years,
             transport=download_transport,
+            resolver=url_resolver,
         )
     hkex = hkex_adapter or HkexnewsAdapter(
-        backfill_years=cfg.backfill_years, transport=download_transport
+        backfill_years=cfg.backfill_years,
+        transport=download_transport,
+        resolver=url_resolver,
     )
     esef = esef_adapter or EsefXbrlAdapter(
-        backfill_years=cfg.backfill_years, transport=download_transport
+        backfill_years=cfg.backfill_years,
+        transport=download_transport,
+        resolver=url_resolver,
     )
 
     sec_ua = sec.user_agent if sec is not None else cfg.sec_user_agent
@@ -158,6 +230,9 @@ async def sync_once(
                     sec_user_agent=sec_ua,
                     transport=download_transport,
                     timeout=cfg.download_timeout,
+                    max_bytes=cfg.max_download_bytes,
+                    allowed_hosts=_ADAPTER_ALLOWED_HOSTS.get(cand.adapter),
+                    resolver=url_resolver,
                 )
             except Exception as exc:
                 result.errors.append(f"download {cand.source_url}: {exc}")
@@ -286,10 +361,15 @@ def export_markdown(
 ) -> list[Path]:
     """One-way disposable Markdown projection from CAS/SQLite to `out_dir`.
 
-    Never reads back into SQLite.
+    Never reads back into SQLite. Rejects symlinks and path traversal.
     """
     target_root = Path(out_dir)
+    if target_root.is_symlink():
+        raise SymlinkRejectedError(f"Export output directory must not be a symlink: {target_root}")
     target_root.mkdir(parents=True, exist_ok=True)
+    if target_root.is_symlink():
+        raise SymlinkRejectedError(f"Export output directory must not be a symlink: {target_root}")
+    resolved_root = target_root.resolve()
 
     if allowed_source_keys is None:
         rows = store.conn.execute("SELECT source_key FROM companies ORDER BY source_key").fetchall()
@@ -297,7 +377,7 @@ def export_markdown(
     else:
         keys = sorted(set(allowed_source_keys))
 
-    docs = store.list_documents(keys, limit=100_000)
+    docs = store.list_all_documents(keys)
     written: list[Path] = []
 
     for doc in docs:
@@ -307,12 +387,51 @@ def export_markdown(
             sections = store.get_sections(doc.document_id)
             md_text = "\n\n".join(s.markdown for s in sections) + "\n"
 
-        safe_key = _SAFE_FILENAME_RE.sub("_", doc.source_key)
-        safe_form = _SAFE_FILENAME_RE.sub("_", doc.form_type)
+        safe_key = _sanitize_path_component(doc.source_key, fallback="issuer")
+        safe_date = _sanitize_path_component(doc.filing_date, fallback="undated")
+        safe_family = _sanitize_path_component(str(doc.form_family.value), fallback="other")
+        safe_doc_id = _sanitize_path_component(doc.document_id, fallback="doc")
+
         issuer_dir = target_root / safe_key
+        if issuer_dir.is_symlink():
+            raise SymlinkRejectedError(
+                f"Export issuer directory must not be a symlink: {issuer_dir}"
+            )
         issuer_dir.mkdir(parents=True, exist_ok=True)
-        out_path = issuer_dir / f"{doc.filing_date}_{safe_form}_{doc.document_id}.md"
-        out_path.write_text(md_text, encoding="utf-8")
+        if issuer_dir.is_symlink():
+            raise SymlinkRejectedError(
+                f"Export issuer directory must not be a symlink: {issuer_dir}"
+            )
+        if not issuer_dir.resolve().is_relative_to(resolved_root):
+            raise ValueError(f"Export issuer directory escapes out_dir: {issuer_dir}")
+
+        out_path = issuer_dir / f"{safe_date}_{safe_family}_{safe_doc_id}.md"
+        if out_path.is_symlink():
+            raise SymlinkRejectedError(f"Export target file must not be a symlink: {out_path}")
+        if not out_path.resolve().is_relative_to(resolved_root):
+            raise ValueError(f"Export target file escapes out_dir: {out_path}")
+
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=issuer_dir,
+                prefix=".export_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(md_text)
+                tmp_file.flush()
+            if out_path.is_symlink():
+                raise SymlinkRejectedError(f"Export target file must not be a symlink: {out_path}")
+            os.replace(tmp_path, out_path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+
         written.append(out_path)
 
     return written

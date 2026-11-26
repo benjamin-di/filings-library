@@ -16,7 +16,12 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from filings_library.service import FilingsService
+from filings_library.service import (
+    FilingsService,
+    clamp_limit,
+    clamp_limit_per_company,
+    clamp_max_chars,
+)
 from filings_library.targets_client import HubUnavailableError
 
 MIN_BEARER_TOKEN_LENGTH = 32
@@ -75,7 +80,7 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
                 source_key=source_key,
                 form_family=form_family,
                 since=since,
-                limit=limit,
+                limit=clamp_limit(limit),
             )
         )
 
@@ -96,7 +101,7 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
                 source_key=source_key,
                 form_family=form_family,
                 since=since,
-                limit=limit,
+                limit=clamp_limit(limit),
             )
         )
 
@@ -115,7 +120,7 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
                 document_id,
                 start_locator=start_locator,
                 end_locator=end_locator,
-                max_chars=max_chars,
+                max_chars=clamp_max_chars(max_chars),
             )
         )
 
@@ -132,7 +137,7 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
                 person,
                 concepts,
                 source_keys=source_keys,
-                limit_per_company=limit_per_company,
+                limit_per_company=clamp_limit_per_company(limit_per_company),
             )
         )
 
@@ -145,12 +150,11 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
     return mcp
 
 
-def _extract_header(scope: Scope, name: str) -> str | None:
+def _extract_headers(scope: Scope, name: str) -> list[str]:
     target = name.lower().encode("latin-1")
-    for key, value in scope.get("headers", []):
-        if key.lower() == target:
-            return value.decode("latin-1")
-    return None
+    return [
+        value.decode("latin-1") for key, value in scope.get("headers", []) if key.lower() == target
+    ]
 
 
 def _inject_no_store(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
@@ -189,7 +193,17 @@ class _ScopedAuthMiddleware:
             await resp(scope, receive, send)
             return
 
-        auth_header = (_extract_header(scope, "authorization") or "").strip()
+        auth_headers = _extract_headers(scope, "authorization")
+        if len(auth_headers) > 1:
+            resp = JSONResponse(
+                {"error": "unauthorized", "detail": "Duplicate Authorization header"},
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+            await resp(scope, receive, send)
+            return
+
+        auth_header = (auth_headers[0] if auth_headers else "").strip()
         scheme, _, provided_token = auth_header.partition(" ")
         provided_token = provided_token.strip()
         if scheme.lower() != "bearer" or not provided_token:
@@ -201,7 +215,9 @@ class _ScopedAuthMiddleware:
             await resp(scope, receive, send)
             return
 
-        if not hmac.compare_digest(provided_token, self._expected_token):
+        if not hmac.compare_digest(
+            provided_token.encode("utf-8"), self._expected_token.encode("utf-8")
+        ):
             resp = JSONResponse(
                 {"error": "unauthorized", "detail": "Invalid bearer token"},
                 status_code=401,
@@ -210,7 +226,17 @@ class _ScopedAuthMiddleware:
             await resp(scope, receive, send)
             return
 
-        subject = (_extract_header(scope, SUBJECT_HEADER) or "").strip()
+        subject_headers = _extract_headers(scope, SUBJECT_HEADER)
+        if len(subject_headers) > 1:
+            resp = JSONResponse(
+                {"error": "forbidden", "detail": "Duplicate X-Fleet-Subject header"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+            await resp(scope, receive, send)
+            return
+
+        subject = (subject_headers[0] if subject_headers else "").strip()
         if not subject:
             resp = JSONResponse(
                 {"error": "forbidden", "detail": "Missing X-Fleet-Subject header"},

@@ -11,6 +11,12 @@ import httpx
 
 from filings_library.adapters import FilingCandidate
 from filings_library.models import CompanyTarget, FormFamily, SourceAdapter
+from filings_library.url_safety import (
+    HKEX_ALLOWED_HOSTS,
+    HostResolver,
+    UnsafeUrlError,
+    validate_public_https_url,
+)
 
 HKEX_STOCK_LIST_URL = "https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json"
 HKEX_SEARCH_URL = "https://www1.hkexnews.hk/search/titleSearchServlet.do"
@@ -119,10 +125,12 @@ class HkexnewsAdapter:
         backfill_years: int = 3,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        resolver: HostResolver | None = None,
     ) -> None:
         self._backfill_years = max(1, backfill_years)
         self._timeout = timeout
         self._transport = transport
+        self._resolver = resolver
 
     async def resolve_stock_id(self, client: httpx.AsyncClient, ticker: str) -> str | None:
         """Resolve an HKEX numeric stock code (e.g. `0700` or `00700`) to `stockId`."""
@@ -207,11 +215,19 @@ class HkexnewsAdapter:
             file_link = str(rec.get("FILE_LINK") or rec.get("file_link") or "").strip()
             if not file_link:
                 continue
-            url = (
+            raw_url = (
                 file_link
                 if file_link.startswith(("http://", "https://"))
                 else f"{HKEX_DOC_BASE}{file_link if file_link.startswith('/') else '/' + file_link}"
             )
+            try:
+                url = validate_public_https_url(
+                    raw_url,
+                    allowed_hosts=HKEX_ALLOWED_HOSTS,
+                    resolver=self._resolver,
+                )
+            except UnsafeUrlError:
+                continue
             fdate = _parse_hkex_date(str(rec.get("DATE_TIME") or rec.get("date_time") or ""))
             if not fdate or fdate < cutoff:
                 continue

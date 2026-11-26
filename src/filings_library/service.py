@@ -17,6 +17,25 @@ from filings_library.targets_client import LibraryTargetsClient
 
 T = TypeVar("T")
 
+MIN_LIMIT = 1
+MAX_LIMIT = 200
+MIN_MAX_CHARS = 100
+MAX_MAX_CHARS = 200_000
+MIN_LIMIT_PER_COMPANY = 1
+MAX_LIMIT_PER_COMPANY = 50
+
+
+def clamp_limit(value: int) -> int:
+    return max(MIN_LIMIT, min(int(value), MAX_LIMIT))
+
+
+def clamp_max_chars(value: int) -> int:
+    return max(MIN_MAX_CHARS, min(int(value), MAX_MAX_CHARS))
+
+
+def clamp_limit_per_company(value: int) -> int:
+    return max(MIN_LIMIT_PER_COMPANY, min(int(value), MAX_LIMIT_PER_COMPANY))
+
 
 class ScopeResolver(Protocol):
     """Resolves the allowed `source_keys` for an authenticated subject."""
@@ -126,6 +145,7 @@ class FilingsService:
     ) -> list[dict[str, Any]]:
         """List documents strictly within `person`'s allowed `source_keys`."""
         allowed = await self._allowed_keys(person)
+        bounded_limit = clamp_limit(limit)
 
         def _query() -> list[dict[str, Any]]:
             docs = self._store.list_documents(
@@ -133,7 +153,7 @@ class FilingsService:
                 source_key=source_key,
                 form_family=form_family,
                 since=since,
-                limit=limit,
+                limit=bounded_limit,
             )
             return [d.model_dump() for d in docs]
 
@@ -151,6 +171,7 @@ class FilingsService:
     ) -> list[dict[str, Any]]:
         """Search filings strictly within `person`'s allowed `source_keys`."""
         allowed = await self._allowed_keys(person)
+        bounded_limit = clamp_limit(limit)
 
         def _query() -> list[dict[str, Any]]:
             citations = search_filings(
@@ -160,7 +181,7 @@ class FilingsService:
                 source_key=source_key,
                 form_family=form_family,
                 since=since,
-                limit=limit,
+                limit=bounded_limit,
             )
             return [c.model_dump() for c in citations]
 
@@ -177,6 +198,7 @@ class FilingsService:
     ) -> dict[str, Any]:
         """Read bounded sections of a document within `person`'s allowed scope."""
         allowed = await self._allowed_keys(person)
+        bounded_max_chars = clamp_max_chars(max_chars)
 
         def _query() -> dict[str, Any]:
             return read_document(
@@ -185,7 +207,7 @@ class FilingsService:
                 allowed_source_keys=allowed,
                 start_locator=start_locator,
                 end_locator=end_locator,
-                max_chars=max_chars,
+                max_chars=bounded_max_chars,
             )
 
         return await self._run_db(_query)
@@ -201,8 +223,9 @@ class FilingsService:
     ) -> list[dict[str, Any]]:
         """Query cached SEC XBRL `companyfacts` across `person`'s allowed companies."""
         allowed = await self._allowed_keys(person)
-        if not concepts or limit_per_company <= 0:
+        if not concepts:
             return []
+        bounded_limit = clamp_limit_per_company(limit_per_company)
 
         if source_keys is not None:
             target_keys = sorted(k for k in set(source_keys) if k in allowed)
@@ -225,7 +248,7 @@ class FilingsService:
                 facts_json = json.loads(raw_bytes.decode("utf-8"))
                 company = self._store.get_company(sk)
                 matched = query_facts(facts_json, concepts, periods=periods)
-                for row in matched[:limit_per_company]:
+                for row in matched[:bounded_limit]:
                     enriched = dict(row)
                     enriched["source_key"] = sk
                     enriched["ticker"] = company.ticker if company else ""

@@ -11,6 +11,12 @@ import httpx
 
 from filings_library.adapters import FilingCandidate
 from filings_library.models import CompanyTarget, FormFamily, SourceAdapter
+from filings_library.url_safety import (
+    SEC_ALLOWED_HOSTS,
+    HostResolver,
+    UnsafeUrlError,
+    validate_public_https_url,
+)
 
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
@@ -57,6 +63,16 @@ def _guess_mime(filename: str) -> str:
     return "text/html"
 
 
+def _is_safe_doc_name(name: str) -> bool:
+    if not name or name in {".", ".."}:
+        return False
+    if "/" in name or "\\" in name or ".." in name:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        return False
+    return True
+
+
 def _select_6k_exhibit(index_json: dict[str, Any], primary_doc: str) -> str:
     """Pick an earnings/results EX-99.* exhibit from a 6-K accession `index.json`."""
     items = index_json.get("directory", {}).get("item", [])
@@ -67,7 +83,9 @@ def _select_6k_exhibit(index_json: dict[str, Any], primary_doc: str) -> str:
     for item in items:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name") or "")
+        name = str(item.get("name") or "").strip()
+        if not _is_safe_doc_name(name):
+            continue
         lower = name.lower()
         if not lower.endswith((".htm", ".html", ".pdf")):
             continue
@@ -102,11 +120,13 @@ class SecEdgarAdapter:
         backfill_years: int = 3,
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        resolver: HostResolver | None = None,
     ) -> None:
         self._user_agent = validate_sec_user_agent(user_agent)
         self._backfill_years = max(1, backfill_years)
         self._timeout = timeout
         self._transport = transport
+        self._resolver = resolver
 
     @property
     def user_agent(self) -> str:
@@ -125,12 +145,18 @@ class SecEdgarAdapter:
         ref_date = today or date.today()
         cutoff = (ref_date - timedelta(days=365 * self._backfill_years)).isoformat()
 
+        submissions_url = validate_public_https_url(
+            SEC_SUBMISSIONS_URL.format(cik=cik),
+            allowed_hosts=SEC_ALLOWED_HOSTS,
+            resolver=self._resolver,
+        )
+
         async with httpx.AsyncClient(
             headers=self._headers(),
             transport=self._transport,
             timeout=self._timeout,
         ) as client:
-            resp = await client.get(SEC_SUBMISSIONS_URL.format(cik=cik))
+            resp = await client.get(submissions_url)
             resp.raise_for_status()
             payload = resp.json()
 
@@ -166,16 +192,22 @@ class SecEdgarAdapter:
 
                 accn = str(accession_numbers[idx]).strip()
                 accn_nodash = accn.replace("-", "")
+                if not accn_nodash or not accn_nodash.isdigit():
+                    continue
                 primary_doc = str(primary_docs[idx]).strip()
                 selected_doc = primary_doc
 
                 if form == "6-K":
-                    index_url = f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/index.json"
+                    index_url = validate_public_https_url(
+                        f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/index.json",
+                        allowed_hosts=SEC_ALLOWED_HOSTS,
+                        resolver=self._resolver,
+                    )
                     idx_resp = await client.get(index_url)
                     if idx_resp.status_code == 200:
                         selected_doc = _select_6k_exhibit(idx_resp.json(), primary_doc)
 
-                if not selected_doc:
+                if not _is_safe_doc_name(selected_doc):
                     continue
 
                 period_end = (
@@ -188,7 +220,14 @@ class SecEdgarAdapter:
                 )
                 is_amendment = form.endswith("/A")
                 base_form = form[:-2] if is_amendment else form
-                source_url = f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/{selected_doc}"
+                try:
+                    source_url = validate_public_https_url(
+                        f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/{selected_doc}",
+                        allowed_hosts=SEC_ALLOWED_HOSTS,
+                        resolver=self._resolver,
+                    )
+                except UnsafeUrlError:
+                    continue
 
                 candidates.append(
                     FilingCandidate(
@@ -213,12 +252,17 @@ class SecEdgarAdapter:
 
     async def fetch_company_facts(self, cik: int) -> dict[str, Any]:
         """Fetch SEC XBRL `companyfacts` JSON for `cik`."""
+        facts_url = validate_public_https_url(
+            SEC_COMPANYFACTS_URL.format(cik=int(cik)),
+            allowed_hosts=SEC_ALLOWED_HOSTS,
+            resolver=self._resolver,
+        )
         async with httpx.AsyncClient(
             headers=self._headers(),
             transport=self._transport,
             timeout=self._timeout,
         ) as client:
-            resp = await client.get(SEC_COMPANYFACTS_URL.format(cik=int(cik)))
+            resp = await client.get(facts_url)
             resp.raise_for_status()
             return dict(resp.json())
 

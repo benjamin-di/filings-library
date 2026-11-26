@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
+from typing import Any
 
 import openpyxl
 import pytest
@@ -168,16 +170,202 @@ def test_pdf_extraction_native_pages_and_anchors() -> None:
     assert "Operating Margin" in extracted.sections[1].markdown
 
 
-def test_pdf_extraction_rejects_encrypted_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail closed with EncryptedPdfError when a PDF requires a user password."""
+def test_pdf_extraction_rejects_encrypted_pdf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fail closed with EncryptedPdfError when qpdf/pdftotext report password errors."""
+    import subprocess
+
     from filings_library.extractor import pdf_extract
 
-    def _raise_encrypted(*_args: object, **_kwargs: object) -> None:
-        raise EncryptedPdfError("PDF requires a user password")
+    # Directly verify _is_password_error against real qpdf/poppler error strings.
+    assert pdf_extract._is_password_error("qpdf: input.pdf: invalid password")
+    assert pdf_extract._is_password_error("Command Line Error: Incorrect password")
+    assert pdf_extract._is_password_error("PDF requires a password")
+    assert not pdf_extract._is_password_error("syntax warning: repaired xref")
 
-    monkeypatch.setattr(pdf_extract, "_unlock_with_qpdf", _raise_encrypted)
-    with pytest.raises(EncryptedPdfError):
+    def _fake_qpdf_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert "--decrypt" in cmd
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=2,
+            stdout="",
+            stderr="qpdf: input.pdf: invalid password\n",
+        )
+
+    monkeypatch.setattr(pdf_extract.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(pdf_extract.subprocess, "run", _fake_qpdf_run)
+
+    src = tmp_path / "enc.pdf"
+    dst = tmp_path / "dec.pdf"
+    src.write_bytes(b"%PDF-1.4\nencrypted-bytes")
+    warnings: list[str] = []
+    with pytest.raises(EncryptedPdfError, match="invalid password"):
+        pdf_extract._unlock_with_qpdf(src, dst, warnings)
+
+    with pytest.raises(EncryptedPdfError, match="invalid password"):
         extract_pdf(b"%PDF-1.4\nencrypted-bytes")
+
+
+def test_html_ixbrl_wrapper_blocks_nested_table_and_empty_rows() -> None:
+    html = """
+    <html>
+      <body>
+        <ix:nonNumeric name="us-gaap:DisclosureTextBlock">
+          Introductory note before heading.
+          <h2>Item 8. Financial Statements</h2>
+          <p>Lead-in text</p>
+          <table>
+            <tr></tr>
+            <tr>
+              <th rowspan="2">Line Item</th>
+              <th>FY2025</th>
+            </tr>
+            <tr></tr>
+            <tr>
+              <td>2025 Actual</td>
+            </tr>
+            <tr>
+              <td>
+                Revenue
+                <table>
+                  <tr><td>Nested Footnote A</td><td>123</td></tr>
+                </table>
+              </td>
+              <td>$22,594</td>
+            </tr>
+          </table>
+        </ix:nonNumeric>
+      </body>
+    </html>
+    """
+    extracted = extract_html_ixbrl(html.encode("utf-8"))
+    # Text before heading is preserved as its own section; heading inside ix:nonNumeric is detected.
+    assert "Introductory note before heading." in extracted.markdown
+    locators = [s.locator for s in extracted.sections]
+    assert "item:8" in locators
+    item8 = next(s for s in extracted.sections if s.locator == "item:8")
+    assert "Lead-in text" in item8.markdown
+    # Outer table must NOT pull nested <table> <tr> rows as outer rows, and empty <tr> must not
+    # skew rowspan alignment: "2025 Actual" belongs in column 2 (under FY2025), not column 1!
+    table_lines = [line for line in item8.markdown.splitlines() if line.startswith("|")]
+    assert table_lines[0] == "| Line Item | FY2025 |"
+    assert table_lines[2] == "|  | 2025 Actual |"
+    assert len(table_lines) == 4  # header, sep, rowspan-2nd-row, Revenue row (no nested rows)
+    assert "$22,594" in table_lines[3]
+
+
+def test_pdf_subprocess_timeouts_ocr_cap_and_png_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from filings_library.extractor import pdf_extract
+
+    # 1. qpdf + pdftotext TimeoutExpired are caught and recorded as warnings.
+    def _timeout_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+
+    monkeypatch.setattr(pdf_extract.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(pdf_extract.subprocess, "run", _timeout_run)
+
+    src = tmp_path / "slow.pdf"
+    dst = tmp_path / "out.pdf"
+    src.write_bytes(b"%PDF-1.4\n")
+    warnings: list[str] = []
+    assert pdf_extract._unlock_with_qpdf(src, dst, warnings, timeout=1) == src
+    assert any("qpdf timed out" in w for w in warnings)
+
+    assert pdf_extract._extract_native_pages_pdftotext(src, warnings, timeout=1) is None
+    assert any("pdftotext timed out" in w for w in warnings)
+
+    # 2. _ocr_page unlinks page_N.png in finally even when tesseract times out.
+    class _FakeBitmap:
+        def to_pil(self) -> Any:
+            return SimpleNamespace(save=lambda path: Path(path).write_bytes(b"PNG"))
+
+    class _FakePage:
+        def render(self, scale: float) -> _FakeBitmap:
+            del scale
+            return _FakeBitmap()
+
+        def close(self) -> None:
+            pass
+
+    class _FakeDoc:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def __getitem__(self, _idx: int) -> _FakePage:
+            return _FakePage()
+
+        def close(self) -> None:
+            pass
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pypdfium2", SimpleNamespace(PdfDocument=_FakeDoc))
+    ocr_warnings: list[str] = []
+    assert pdf_extract._ocr_page(src, 0, tmp_path, ocr_warnings, timeout=1) is None
+    assert any("tesseract timed out" in w for w in ocr_warnings)
+    assert not (tmp_path / "page_1.png").exists()
+
+    # 3. max_ocr_pages caps OCR invocations and records a warning.
+    monkeypatch.setattr(pdf_extract, "_unlock_with_qpdf", lambda s, d, w: s)
+    monkeypatch.setattr(
+        pdf_extract, "_extract_native_pages_pdftotext", lambda p, w=None: ["", "", ""]
+    )
+    ocr_calls: list[int] = []
+
+    def _fake_ocr(p: Path, idx: int, td: Path, w: list[str]) -> str | None:
+        del p, td, w
+        ocr_calls.append(idx)
+        return f"OCR text page {idx + 1} with sufficient characters"
+
+    monkeypatch.setattr(pdf_extract, "_ocr_page", _fake_ocr)
+    doc = extract_pdf(b"%PDF-1.4\n", max_ocr_pages=2)
+    assert ocr_calls == [0, 1]
+    assert doc.ocr_pages == [1, 2]
+    assert any("OCR page cap (2) exceeded" in w for w in doc.warnings)
+
+
+@pytest.mark.asyncio
+async def test_extractor_streaming_413_rejects_oversized_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from filings_library.extractor import app as extractor_app
+
+    monkeypatch.setattr(extractor_app, "MAX_EXTRACT_BYTES", 64)
+    asgi_app = extractor_app.create_extractor_app()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://extractor.local",
+    ) as client:
+        # 1. Early rejection via Content-Length header
+        resp_cl = await client.post(
+            "/extract",
+            params={"mime_type": "text/html", "filename": "big.html"},
+            content=b"x" * 100,
+        )
+        assert resp_cl.status_code == 413
+        assert resp_cl.json()["error"] == "payload_too_large"
+
+        # 2. Streaming rejection without Content-Length (chunked generator)
+        async def _chunks() -> Any:
+            yield b"<html><body>" + b"a" * 40
+            yield b"b" * 40 + b"</body></html>"
+
+        resp_stream = await client.post(
+            "/extract",
+            params={"mime_type": "text/html", "filename": "stream.html"},
+            content=_chunks(),
+        )
+        assert resp_stream.status_code == 413
+        assert resp_stream.json()["error"] == "payload_too_large"
 
 
 @pytest.mark.asyncio

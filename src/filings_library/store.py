@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,8 @@ from filings_library.models import (
 
 SCHEMA_VERSION = 1
 DEFAULT_GLOBAL_CAP_BYTES = 10 * 1024 * 1024 * 1024  # 10 GiB
+MIN_QUERY_LIMIT = 1
+MAX_QUERY_LIMIT = 200
 
 _COMMA_NUMBER_RE = re.compile(r"(?<!\d)\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)")
 
@@ -229,41 +232,57 @@ class FilingsStore:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    @contextmanager
+    def _tx(self) -> Iterator[None]:
+        if self._conn.in_transaction:
+            yield
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
     # ------------------------------------------------------------------
     # Companies
     # ------------------------------------------------------------------
     def upsert_company(self, company: CompanyTarget) -> None:
         now = utc_now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO companies(
-                source_key, ticker, exchange, name, isin, sec_cik,
-                hkex_stock_id, lei, ir_urls_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_key) DO UPDATE SET
-                ticker = excluded.ticker,
-                exchange = excluded.exchange,
-                name = excluded.name,
-                isin = excluded.isin,
-                sec_cik = excluded.sec_cik,
-                hkex_stock_id = excluded.hkex_stock_id,
-                lei = excluded.lei,
-                ir_urls_json = excluded.ir_urls_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                company.source_key,
-                company.ticker,
-                company.exchange,
-                company.name,
-                company.isin,
-                company.sec_cik,
-                company.hkex_stock_id,
-                company.lei,
-                json.dumps(company.ir_urls),
-                now,
-            ),
-        )
+        with self._tx():
+            self._conn.execute(
+                """
+                INSERT INTO companies(
+                    source_key, ticker, exchange, name, isin, sec_cik,
+                    hkex_stock_id, lei, ir_urls_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    ticker = excluded.ticker,
+                    exchange = excluded.exchange,
+                    name = excluded.name,
+                    isin = excluded.isin,
+                    sec_cik = excluded.sec_cik,
+                    hkex_stock_id = excluded.hkex_stock_id,
+                    lei = excluded.lei,
+                    ir_urls_json = excluded.ir_urls_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    company.source_key,
+                    company.ticker,
+                    company.exchange,
+                    company.name,
+                    company.isin,
+                    company.sec_cik,
+                    company.hkex_stock_id,
+                    company.lei,
+                    json.dumps(company.ir_urls),
+                    now,
+                ),
+            )
 
     def get_company(self, source_key: str) -> CompanyTarget | None:
         row = self._conn.execute(
@@ -303,59 +322,60 @@ class FilingsStore:
     # ------------------------------------------------------------------
     def upsert_document(self, doc: DocumentRecord) -> None:
         now = utc_now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO documents(
-                document_id, source_key, adapter, external_id, form_type, form_family,
-                title, filing_date, period_end, language, source_url, source_sha256,
-                source_mime, source_bytes, refetchable, is_amendment,
-                supersedes_document_id, converter_id, converter_version,
-                markdown_sha256, page_count, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_key, adapter, external_id) DO UPDATE SET
-                form_type = excluded.form_type,
-                form_family = excluded.form_family,
-                title = excluded.title,
-                filing_date = excluded.filing_date,
-                period_end = excluded.period_end,
-                language = excluded.language,
-                source_url = excluded.source_url,
-                source_sha256 = excluded.source_sha256,
-                source_mime = excluded.source_mime,
-                source_bytes = excluded.source_bytes,
-                refetchable = excluded.refetchable,
-                is_amendment = excluded.is_amendment,
-                supersedes_document_id = excluded.supersedes_document_id,
-                converter_id = excluded.converter_id,
-                converter_version = excluded.converter_version,
-                markdown_sha256 = excluded.markdown_sha256,
-                page_count = excluded.page_count
-            """,
-            (
-                doc.document_id,
-                doc.source_key,
-                str(doc.adapter),
-                doc.external_id,
-                doc.form_type,
-                str(doc.form_family),
-                doc.title,
-                doc.filing_date,
-                doc.period_end,
-                doc.language,
-                doc.source_url,
-                doc.source_sha256,
-                doc.source_mime,
-                doc.source_bytes,
-                1 if doc.refetchable else 0,
-                1 if doc.is_amendment else 0,
-                doc.supersedes_document_id,
-                doc.converter_id,
-                doc.converter_version,
-                doc.markdown_sha256,
-                doc.page_count,
-                now,
-            ),
-        )
+        with self._tx():
+            self._conn.execute(
+                """
+                INSERT INTO documents(
+                    document_id, source_key, adapter, external_id, form_type, form_family,
+                    title, filing_date, period_end, language, source_url, source_sha256,
+                    source_mime, source_bytes, refetchable, is_amendment,
+                    supersedes_document_id, converter_id, converter_version,
+                    markdown_sha256, page_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key, adapter, external_id) DO UPDATE SET
+                    form_type = excluded.form_type,
+                    form_family = excluded.form_family,
+                    title = excluded.title,
+                    filing_date = excluded.filing_date,
+                    period_end = excluded.period_end,
+                    language = excluded.language,
+                    source_url = excluded.source_url,
+                    source_sha256 = excluded.source_sha256,
+                    source_mime = excluded.source_mime,
+                    source_bytes = excluded.source_bytes,
+                    refetchable = excluded.refetchable,
+                    is_amendment = excluded.is_amendment,
+                    supersedes_document_id = excluded.supersedes_document_id,
+                    converter_id = excluded.converter_id,
+                    converter_version = excluded.converter_version,
+                    markdown_sha256 = excluded.markdown_sha256,
+                    page_count = excluded.page_count
+                """,
+                (
+                    doc.document_id,
+                    doc.source_key,
+                    str(doc.adapter),
+                    doc.external_id,
+                    doc.form_type,
+                    str(doc.form_family),
+                    doc.title,
+                    doc.filing_date,
+                    doc.period_end,
+                    doc.language,
+                    doc.source_url,
+                    doc.source_sha256,
+                    doc.source_mime,
+                    doc.source_bytes,
+                    1 if doc.refetchable else 0,
+                    1 if doc.is_amendment else 0,
+                    doc.supersedes_document_id,
+                    doc.converter_id,
+                    doc.converter_version,
+                    doc.markdown_sha256,
+                    doc.page_count,
+                    now,
+                ),
+            )
 
     def get_document(self, document_id: str) -> DocumentRecord | None:
         row = self._conn.execute(
@@ -400,12 +420,26 @@ class FilingsStore:
         if since is not None:
             clauses.append("filing_date >= ?")
             params.append(since)
-        params.append(limit)
+        bounded_limit = max(MIN_QUERY_LIMIT, min(int(limit), MAX_QUERY_LIMIT))
+        params.append(bounded_limit)
         sql = (
             f"SELECT * FROM documents WHERE {' AND '.join(clauses)} "
             "ORDER BY filing_date DESC, document_id ASC LIMIT ?"
         )
         rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_document(r) for r in rows]
+
+    def list_all_documents(self, allowed_source_keys: Collection[str]) -> list[DocumentRecord]:
+        """List all documents for internal bulk operations such as Markdown export."""
+        allowed = sorted(set(allowed_source_keys))
+        if not allowed:
+            return []
+        placeholders = ",".join("?" for _ in allowed)
+        rows = self._conn.execute(
+            f"SELECT * FROM documents WHERE source_key IN ({placeholders}) "
+            "ORDER BY filing_date DESC, document_id ASC",
+            allowed,
+        ).fetchall()
         return [self._row_to_document(r) for r in rows]
 
     def find_superseded_document_id(
@@ -493,23 +527,24 @@ class FilingsStore:
         byte_size: int,
     ) -> None:
         now = utc_now_iso()
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO artifacts(
-                source_sha256, kind, converter_id, converter_version,
-                artifact_sha256, byte_size, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                source_sha256,
-                str(kind),
-                converter_id,
-                converter_version,
-                artifact_sha256,
-                byte_size,
-                now,
-            ),
-        )
+        with self._tx():
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO artifacts(
+                    source_sha256, kind, converter_id, converter_version,
+                    artifact_sha256, byte_size, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_sha256,
+                    str(kind),
+                    converter_id,
+                    converter_version,
+                    artifact_sha256,
+                    byte_size,
+                    now,
+                ),
+            )
 
     def get_artifact(
         self,
@@ -532,10 +567,10 @@ class FilingsStore:
     # Sections & FTS5
     # ------------------------------------------------------------------
     def replace_sections(self, document_id: str, sections: Sequence[ExtractedSection]) -> None:
-        doc = self.get_document(document_id)
-        if doc is None:
-            raise KeyError(f"Unknown document_id: {document_id}")
-        with self._conn:
+        with self._tx():
+            doc = self.get_document(document_id)
+            if doc is None:
+                raise KeyError(f"Unknown document_id: {document_id}")
             self._conn.execute("DELETE FROM sections WHERE document_id = ?", (document_id,))
             self._conn.execute("DELETE FROM fts_chunks WHERE document_id = ?", (document_id,))
             for sec in sections:
@@ -592,22 +627,9 @@ class FilingsStore:
         ]
 
     def rebuild_fts(self) -> int:
-        """Drop and deterministically repopulate `fts_chunks` from `sections`."""
-        with self._conn:
-            self._conn.execute("DROP TABLE IF EXISTS fts_chunks;")
-            self._conn.execute(
-                """
-                CREATE VIRTUAL TABLE fts_chunks USING fts5(
-                    title,
-                    body,
-                    normalized_numbers,
-                    document_id UNINDEXED,
-                    source_key UNINDEXED,
-                    locator UNINDEXED,
-                    tokenize='unicode61'
-                );
-                """
-            )
+        """Atomically clear and deterministically repopulate `fts_chunks` from `sections`."""
+        with self._tx():
+            self._conn.execute("DELETE FROM fts_chunks;")
             rows = self._conn.execute(
                 """
                 SELECT s.document_id, d.source_key, s.locator, s.title, s.markdown
@@ -640,17 +662,18 @@ class FilingsStore:
     # ------------------------------------------------------------------
     def upsert_company_facts(self, source_key: str, cik: int, facts_sha256: str) -> None:
         now = utc_now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO company_facts(source_key, cik, facts_sha256, fetched_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(source_key) DO UPDATE SET
-                cik = excluded.cik,
-                facts_sha256 = excluded.facts_sha256,
-                fetched_at = excluded.fetched_at
-            """,
-            (source_key, cik, facts_sha256, now),
-        )
+        with self._tx():
+            self._conn.execute(
+                """
+                INSERT INTO company_facts(source_key, cik, facts_sha256, fetched_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    cik = excluded.cik,
+                    facts_sha256 = excluded.facts_sha256,
+                    fetched_at = excluded.fetched_at
+                """,
+                (source_key, cik, facts_sha256, now),
+            )
 
     def get_company_facts(self, source_key: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -663,15 +686,16 @@ class FilingsStore:
     # ------------------------------------------------------------------
     def enqueue_job(self, kind: str, payload: dict[str, Any], *, max_attempts: int = 3) -> int:
         now = utc_now_iso()
-        cur = self._conn.execute(
-            """
-            INSERT INTO jobs(kind, payload_json, status, attempts, max_attempts, created_at, updated_at)
-            VALUES (?, ?, 'pending', 0, ?, ?, ?)
-            """,
-            (kind, json.dumps(payload, sort_keys=True), max(1, max_attempts), now, now),
-        )
-        assert cur.lastrowid is not None
-        return int(cur.lastrowid)
+        with self._tx():
+            cur = self._conn.execute(
+                """
+                INSERT INTO jobs(kind, payload_json, status, attempts, max_attempts, created_at, updated_at)
+                VALUES (?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (kind, json.dumps(payload, sort_keys=True), max(1, max_attempts), now, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
 
     def lease_job(
         self, owner: str, *, lease_seconds: int = 300, now: datetime | None = None
@@ -679,7 +703,7 @@ class FilingsStore:
         current = now or datetime.now(tz=UTC)
         now_iso = current.strftime("%Y-%m-%dT%H:%M:%SZ")
         expires_iso = (current + timedelta(seconds=lease_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with self._conn:
+        with self._tx():
             row = self._conn.execute(
                 """
                 SELECT * FROM jobs
@@ -713,34 +737,36 @@ class FilingsStore:
 
     def complete_job(self, job_id: int) -> None:
         now = utc_now_iso()
-        self._conn.execute(
-            """
-            UPDATE jobs
-            SET status = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (now, job_id),
-        )
+        with self._tx():
+            self._conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, job_id),
+            )
 
     def fail_job(self, job_id: int, error: str) -> str:
         """Record a job failure; returns `'pending'` if retryable or `'dead'` if exhausted."""
         now = utc_now_iso()
-        row = self._conn.execute(
-            "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Unknown job_id: {job_id}")
-        next_status = "dead" if int(row["attempts"]) >= int(row["max_attempts"]) else "pending"
-        self._conn.execute(
-            """
-            UPDATE jobs
-            SET status = ?, last_error = ?, lease_owner = NULL,
-                lease_expires_at = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (next_status, error[:2000], now, job_id),
-        )
-        return next_status
+        with self._tx():
+            row = self._conn.execute(
+                "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown job_id: {job_id}")
+            next_status = "dead" if int(row["attempts"]) >= int(row["max_attempts"]) else "pending"
+            self._conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, last_error = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (next_status, error[:2000], now, job_id),
+            )
+            return next_status
 
     # ------------------------------------------------------------------
     # Storage usage & quotas

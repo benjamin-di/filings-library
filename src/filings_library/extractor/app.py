@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import shutil
 from typing import Any
@@ -52,12 +53,28 @@ async def _health(_request: Request) -> JSONResponse:
 
 
 async def _extract(request: Request) -> JSONResponse:
-    body = await request.body()
-    if len(body) > MAX_EXTRACT_BYTES:
-        return JSONResponse(
-            {"error": "payload_too_large", "detail": f"Max size is {MAX_EXTRACT_BYTES} bytes"},
-            status_code=413,
-        )
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length.strip())
+        except ValueError:
+            declared_size = -1
+        if declared_size > MAX_EXTRACT_BYTES:
+            return JSONResponse(
+                {"error": "payload_too_large", "detail": f"Max size is {MAX_EXTRACT_BYTES} bytes"},
+                status_code=413,
+            )
+
+    buf = bytearray()
+    async for chunk in request.stream():
+        if len(buf) + len(chunk) > MAX_EXTRACT_BYTES:
+            return JSONResponse(
+                {"error": "payload_too_large", "detail": f"Max size is {MAX_EXTRACT_BYTES} bytes"},
+                status_code=413,
+            )
+        buf.extend(chunk)
+    body = bytes(buf)
+
     if not body:
         return JSONResponse(
             {"error": "empty_body", "detail": "Request body must not be empty"},
@@ -78,11 +95,11 @@ async def _extract(request: Request) -> JSONResponse:
 
     try:
         if kind == "html":
-            extracted = extract_html_ixbrl(body)
+            extracted = await asyncio.to_thread(extract_html_ixbrl, body)
         elif kind == "pdf":
-            extracted = extract_pdf(body)
+            extracted = await asyncio.to_thread(extract_pdf, body)
         else:
-            extracted = extract_xlsx(body)
+            extracted = await asyncio.to_thread(extract_xlsx, body)
     except EncryptedPdfError as exc:
         return JSONResponse(
             {"error": "encrypted_pdf", "detail": str(exc)},

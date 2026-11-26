@@ -27,6 +27,12 @@ _FORM_FAMILY_WEIGHTS: dict[str, float] = {
 _FORMATTED_NUM_TOKEN_RE = re.compile(r"^[($€£¥]*(\d{1,3}(?:,\d{3})+(?:\.\d+)?)[)%]*$")
 _QUOTED_OR_WORD_RE = re.compile(r'"([^"]+)"|(\S+)')
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+MIN_SEARCH_LIMIT = 1
+MAX_SEARCH_LIMIT = 200
+MIN_READ_MAX_CHARS = 100
+MAX_READ_MAX_CHARS = 200_000
 
 
 class DocumentNotFoundError(KeyError):
@@ -35,8 +41,9 @@ class DocumentNotFoundError(KeyError):
 
 def normalize_query(query: str) -> str:
     """Convert a user query into a safe FTS5 MATCH query with numeric normalization."""
+    sanitized = _CONTROL_CHARS_RE.sub(" ", query or "")
     terms: list[str] = []
-    for match in _QUOTED_OR_WORD_RE.finditer(query.strip()):
+    for match in _QUOTED_OR_WORD_RE.finditer(sanitized.strip()):
         quoted, raw = match.group(1), match.group(2)
         if quoted is not None:
             cleaned = quoted.replace('"', " ").strip()
@@ -132,8 +139,9 @@ def search_filings(
 ) -> list[Citation]:
     """Search filings strictly within `allowed_source_keys` using financial ranking."""
     allowed = sorted(set(allowed_source_keys))
-    if not allowed or limit <= 0:
+    if not allowed:
         return []
+    bounded_limit = max(MIN_SEARCH_LIMIT, min(int(limit), MAX_SEARCH_LIMIT))
     if source_key is not None:
         if source_key not in allowed:
             return []
@@ -156,7 +164,7 @@ def search_filings(
         clauses.append("d.filing_date >= ?")
         params.append(since)
 
-    candidate_limit = max(limit * 6, 120)
+    candidate_limit = max(bounded_limit * 6, 120)
     params.append(candidate_limit)
 
     sql = f"""
@@ -259,7 +267,7 @@ def search_filings(
             continue
         prior_list.append(shingles)
         results.append(citation)
-        if len(results) >= limit:
+        if len(results) >= bounded_limit:
             break
 
     return results
@@ -275,6 +283,7 @@ def read_document(
     max_chars: int = 24000,
 ) -> dict[str, Any]:
     """Read bounded sections of a document with strict `allowed_source_keys` enforcement."""
+    bounded_max_chars = max(MIN_READ_MAX_CHARS, min(int(max_chars), MAX_READ_MAX_CHARS))
     allowed = set(allowed_source_keys)
     doc = store.get_document(document_id)
     if doc is None or doc.source_key not in allowed:
@@ -305,7 +314,7 @@ def read_document(
     converter_id = doc.converter_id or "unknown"
 
     for sec in selected:
-        remaining = max_chars - total_chars
+        remaining = bounded_max_chars - total_chars
         if remaining <= 0:
             truncated = True
             break

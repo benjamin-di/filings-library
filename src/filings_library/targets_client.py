@@ -54,15 +54,16 @@ class LibraryTargetsClient:
         if self._token:
             return self._token.strip()
         if self._token_file is not None:
-            mode = self._token_file.stat().st_mode
-            if mode & (stat.S_IRWXG | stat.S_IRWXO):
-                raise PermissionError(
-                    f"Bearer token file must be 0600 (no group/other access): {self._token_file}"
-                )
-            token = self._token_file.read_text(encoding="utf-8").strip()
-            if not token:
-                raise ValueError(f"Bearer token file is empty: {self._token_file}")
-            return token
+            try:
+                mode = self._token_file.stat().st_mode
+                if mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    raise PermissionError("Bearer token file must be 0600")
+                token = self._token_file.read_text(encoding="utf-8").strip()
+                if not token:
+                    raise ValueError("Bearer token file is empty")
+                return token
+            except (OSError, ValueError) as exc:
+                raise HubUnavailableError("targets bearer token unavailable") from exc
         env_token = os.environ.get(DEFAULT_TOKEN_ENV, "").strip()
         if not env_token:
             raise HubUnavailableError(

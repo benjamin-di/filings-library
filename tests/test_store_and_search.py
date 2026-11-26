@@ -410,3 +410,111 @@ def test_quota_enforcement_and_job_queue_dead_letter(tmp_path: Path) -> None:
     assert store.fail_job(job_id, "permanent error") == "dead"
     assert store.lease_job("worker-1") is None
     store.close()
+
+
+def test_replace_sections_atomic_rollback_on_mid_write_error(tmp_path: Path) -> None:
+    import sqlite3
+
+    store = FilingsStore(tmp_path / "library.sqlite3")
+    try:
+        store.upsert_company(_make_company("tx-co", "TXC", "Transaction Co"))
+        doc = _make_doc(
+            doc_id="doc-tx",
+            source_key="tx-co",
+            external_id="tx-1",
+            form_type="10-K",
+            form_family=FormFamily.ANNUAL_REPORT,
+            filing_date="2026-02-01",
+        )
+        store.upsert_document(doc)
+        store.replace_sections(
+            "doc-tx",
+            [
+                ExtractedSection(
+                    locator="item:1",
+                    title="Original Business",
+                    ordinal=1,
+                    markdown="Original durable revenue text.",
+                )
+            ],
+        )
+
+        # Duplicate locator in the second section triggers UNIQUE constraint mid-write.
+        with pytest.raises(sqlite3.IntegrityError):
+            store.replace_sections(
+                "doc-tx",
+                [
+                    ExtractedSection(
+                        locator="item:1",
+                        title="Replacement",
+                        ordinal=1,
+                        markdown="Partial write that must roll back.",
+                    ),
+                    ExtractedSection(
+                        locator="item:1",
+                        title="Duplicate Locator",
+                        ordinal=2,
+                        markdown="Triggers IntegrityError.",
+                    ),
+                ],
+            )
+
+        # Original sections and FTS5 index must remain completely intact.
+        sections = store.get_sections("doc-tx")
+        assert len(sections) == 1
+        assert sections[0].markdown == "Original durable revenue text."
+        hits = search_filings(store, "durable", allowed_source_keys={"tx-co"})
+        assert len(hits) == 1
+        assert hits[0].document_id == "doc-tx"
+        assert search_filings(store, "Partial", allowed_source_keys={"tx-co"}) == []
+    finally:
+        store.close()
+
+
+def test_fts5_hostile_queries_and_limit_clamping(tmp_path: Path) -> None:
+    store = FilingsStore(tmp_path / "library.sqlite3")
+    try:
+        store.upsert_company(_make_company("sec-co", "SEC", "Security Co"))
+        for idx in range(3):
+            doc = _make_doc(
+                doc_id=f"doc-{idx}",
+                source_key="sec-co",
+                external_id=f"ext-{idx}",
+                form_type="10-K",
+                form_family=FormFamily.ANNUAL_REPORT,
+                filing_date=f"2026-02-0{idx + 1}",
+            )
+            store.upsert_document(doc)
+            store.replace_sections(
+                doc.document_id,
+                [
+                    ExtractedSection(
+                        locator="item:1",
+                        title="Overview",
+                        ordinal=1,
+                        markdown=f"Unique term alpha{idx} and revenue growth " + ("z" * 200),
+                    )
+                ],
+            )
+
+        # Hostile FTS5 queries with NUL bytes, control chars, and unmatched quotes must not crash.
+        for hostile in ["a\x00b", 'revenue "unclosed', "\x00\x01\x02\x1f\x7f", '"a\x00b"']:
+            result = search_filings(store, hostile, allowed_source_keys={"sec-co"})
+            assert isinstance(result, list)
+
+        # Negative/zero limits are clamped to 1 (never SQLite LIMIT -1 returning all rows).
+        assert len(store.list_documents({"sec-co"}, limit=-1)) == 1
+        assert len(store.list_documents({"sec-co"}, limit=0)) == 1
+        assert len(search_filings(store, "revenue", allowed_source_keys={"sec-co"}, limit=-1)) == 1
+
+        # max_chars below 100 is clamped up to 100.
+        read_res = read_document(
+            store,
+            document_id="doc-0",
+            allowed_source_keys={"sec-co"},
+            max_chars=-50,
+        )
+        assert read_res["total_chars"] == 100
+        assert read_res["truncated"] is True
+    finally:
+        store.close()

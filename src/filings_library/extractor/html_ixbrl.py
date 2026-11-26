@@ -19,6 +19,22 @@ _NUMERIC_LIKE_RE = re.compile(r"^[\(\-\+$€£¥]*\d[\d,\.]*[\)%]*$|^[\u2014\u20
 _ITEM_HEADING_RE = re.compile(r"^\s*item\s+(\d+[a-z]?)\b", re.IGNORECASE)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _WHITESPACE_RE = re.compile(r"\s+")
+_BLOCK_TAGS = (
+    "div",
+    "p",
+    "table",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "ul",
+    "ol",
+    "li",
+    "section",
+    "article",
+    "blockquote",
+    "pre",
+)
 
 
 def _clean_text(text: str) -> str:
@@ -74,7 +90,7 @@ def _table_to_markdown(table: Tag) -> str:
     """Convert an HTML table to Markdown with explicit colspan/rowspan expansion
     and SEC iXBRL currency/parenthesis split-cell merging.
     """
-    rows = table.find_all("tr")
+    rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
     if not rows:
         return ""
 
@@ -83,17 +99,18 @@ def _table_to_markdown(table: Tag) -> str:
     span_origin: dict[tuple[int, int], int] = {}
     occupied: dict[tuple[int, int], str] = {}
 
-    for r_idx, tr in enumerate(rows):
+    for tr in rows:
         cells = tr.find_all(["th", "td"], recursive=False)
         if not cells:
             continue
+        grid_r = len(grid)
         row_vals: list[str] = []
         c_idx = 0
 
         def _fill_occupied() -> None:
             nonlocal c_idx
-            while (r_idx, c_idx) in occupied:
-                row_vals.append(occupied[(r_idx, c_idx)])
+            while (grid_r, c_idx) in occupied:
+                row_vals.append(occupied[(grid_r, c_idx)])
                 c_idx += 1
 
         _fill_occupied()
@@ -103,14 +120,14 @@ def _table_to_markdown(table: Tag) -> str:
             colspan = _parse_span(cell.get("colspan"))
             rowspan = _parse_span(cell.get("rowspan"))
             if colspan > 1:
-                span_origin[(r_idx, c_idx)] = colspan
+                span_origin[(grid_r, c_idx)] = colspan
             for dr in range(rowspan):
                 for dc in range(colspan):
                     val = text if (dr == 0 and dc == 0) else ""
                     if dr == 0:
                         row_vals.append(val)
                     else:
-                        occupied[(r_idx + dr, c_idx + dc)] = val
+                        occupied[(grid_r + dr, c_idx + dc)] = val
             c_idx += colspan
         _fill_occupied()
         grid.append(row_vals)
@@ -222,7 +239,11 @@ def _collect_blocks(root: Tag) -> list[tuple[str, str]]:
             # If the paragraph contains a nested table, recurse instead of flattening.
             if node.find("table"):
                 for child in node.children:
-                    if isinstance(child, Tag):
+                    if isinstance(child, NavigableString):
+                        text = _clean_text(str(child))
+                        if text:
+                            blocks.append(("text", text))
+                    elif isinstance(child, Tag):
                         _walk(child)
                 return
             text = _clean_text(node.get_text(" ", strip=True))
@@ -230,20 +251,18 @@ def _collect_blocks(root: Tag) -> list[tuple[str, str]]:
                 prefix = "- " if name == "li" else ""
                 blocks.append(("text", f"{prefix}{text}"))
             return
-        # Generic container (div, section, body, article, etc.)
-        has_block_child = any(
-            isinstance(c, Tag)
-            and (c.name or "").lower()
-            in {"div", "p", "table", "h1", "h2", "h3", "h4", "ul", "ol", "li", "section", "article"}
-            for c in node.children
-        )
-        if not has_block_child:
+        # Generic container (div, section, body, article, ix:nonNumeric, span, etc.)
+        if node.find(_BLOCK_TAGS) is None:
             text = _clean_text(node.get_text(" ", strip=True))
             if text:
                 blocks.append(("text", text))
             return
         for child in node.children:
-            if isinstance(child, Tag):
+            if isinstance(child, NavigableString):
+                text = _clean_text(str(child))
+                if text:
+                    blocks.append(("text", text))
+            elif isinstance(child, Tag):
                 _walk(child)
 
     _walk(root)

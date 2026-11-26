@@ -14,15 +14,31 @@ from filings_library.adapters.earnings_watch import EarningsWatchAdapter
 from filings_library.adapters.esef_xbrl import EsefXbrlAdapter
 from filings_library.adapters.hkexnews import HkexnewsAdapter, is_kept_hkex_filing
 from filings_library.adapters.sec_edgar import SecEdgarAdapter, query_facts
-from filings_library.cas import ContentAddressedStore
+from filings_library.cas import ContentAddressedStore, SymlinkRejectedError
 from filings_library.extractor.app import ExtractorClient
-from filings_library.models import CompanyTarget, FormFamily, VerifiedDocumentHint
+from filings_library.models import (
+    CompanyTarget,
+    DocumentRecord,
+    ExtractedSection,
+    FormFamily,
+    SourceAdapter,
+    VerifiedDocumentHint,
+)
 from filings_library.search import search_filings
 from filings_library.store import FilingsStore
 from filings_library.targets_client import HubUnavailableError, LibraryTargetsClient
-from filings_library.worker import SyncConfig, export_markdown, sync_once
+from filings_library.url_safety import (
+    SEC_ALLOWED_HOSTS,
+    UnsafeUrlError,
+    validate_public_https_url,
+)
+from filings_library.worker import SyncConfig, _download_bytes, export_markdown, sync_once
 
 SEC_UA = "FilingsLibraryTest/0.1 (contact@example.test)"
+
+
+def _public_test_resolver(_host: str, _port: int) -> list[str]:
+    return ["93.184.216.34"]
 
 
 def test_sec_user_agent_enforcement() -> None:
@@ -136,6 +152,7 @@ async def test_sec_edgar_10q_6k_ex99_and_companyfacts() -> None:
         user_agent=SEC_UA,
         backfill_years=3,
         transport=httpx.MockTransport(_handler),
+        resolver=_public_test_resolver,
     )
     company = CompanyTarget(
         source_key="example-us", ticker="EXMP", exchange="XNAS", name="Example US", sec_cik=123456
@@ -239,7 +256,11 @@ async def test_hkexnews_noise_rejection_and_stock_id_resolution() -> None:
             return httpx.Response(200, json={"result": json.dumps(search_records)})
         return httpx.Response(404)
 
-    adapter = HkexnewsAdapter(backfill_years=3, transport=httpx.MockTransport(_handler))
+    adapter = HkexnewsAdapter(
+        backfill_years=3,
+        transport=httpx.MockTransport(_handler),
+        resolver=_public_test_resolver,
+    )
     company = CompanyTarget(
         source_key="example-hk", ticker="0700.HK", exchange="XHKG", name="Example HK"
     )
@@ -297,14 +318,18 @@ async def test_esef_xbrl_and_earnings_watch_adapters() -> None:
         ],
     )
 
-    esef = EsefXbrlAdapter(backfill_years=3, transport=httpx.MockTransport(_esef_handler))
+    esef = EsefXbrlAdapter(
+        backfill_years=3,
+        transport=httpx.MockTransport(_esef_handler),
+        resolver=_public_test_resolver,
+    )
     esef_cands = await esef.discover(eu_company, today=date(2026, 11, 26))
     assert len(esef_cands) == 1
     assert esef_cands[0].source_url == (
         "https://filings.xbrl.org/549300TESTLEI0000001/2025-12-31/ESEF/DE/0/report.xhtml"
     )
 
-    ew = EarningsWatchAdapter()
+    ew = EarningsWatchAdapter(resolver=_public_test_resolver)
     ew_cands = await ew.discover(eu_company, today=date(2026, 11, 26))
     assert len(ew_cands) == 1
     assert ew_cands[0].refetchable is False
@@ -469,6 +494,7 @@ async def test_end_to_end_sync_once_and_export_markdown(tmp_path: Path) -> None:
         extractor_client=extractor_client,
         config=SyncConfig(sec_user_agent=SEC_UA),
         download_transport=transport,
+        url_resolver=_public_test_resolver,
         today=date(2026, 11, 26),
     )
     assert res1.errors == []
@@ -496,6 +522,7 @@ async def test_end_to_end_sync_once_and_export_markdown(tmp_path: Path) -> None:
         extractor_client=extractor_client,
         config=SyncConfig(sec_user_agent=SEC_UA),
         download_transport=transport,
+        url_resolver=_public_test_resolver,
         today=date(2026, 11, 26),
     )
     assert res2.documents_ingested == 0
@@ -506,3 +533,215 @@ async def test_end_to_end_sync_once_and_export_markdown(tmp_path: Path) -> None:
     assert len(exported) == 3
     assert all(p.is_file() and p.suffix == ".md" for p in exported)
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_ssrf_url_validation_redirects_sec_host_and_streaming_cap() -> None:
+    # 1. Direct URL safety checks
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url("http://www.sec.gov/file.htm", resolver=_public_test_resolver)
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url("file:///etc/passwd", resolver=_public_test_resolver)
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url(
+            "https://user:pass@www.sec.gov/file.htm", resolver=_public_test_resolver
+        )
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url("https://127.0.0.1/internal", resolver=_public_test_resolver)
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url("https://10.0.0.5/internal", resolver=_public_test_resolver)
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url(
+            "https://private.example.test/doc.pdf",
+            resolver=lambda _h, _p: ["192.168.1.10"],
+        )
+    with pytest.raises(UnsafeUrlError):
+        validate_public_https_url(
+            "https://evilsec.gov/Archives/edgar/data/1/doc.htm",
+            allowed_hosts=SEC_ALLOWED_HOSTS,
+            resolver=_public_test_resolver,
+        )
+
+    # 2. _download_bytes does NOT leak SEC User-Agent to evilsec.gov, blocks redirect-to-loopback,
+    #    and aborts streaming over max_bytes.
+    seen_headers: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "evilsec.gov" in url:
+            seen_headers.update(dict(request.headers))
+            return httpx.Response(200, content=b"ok")
+        if "redirect-loopback" in url:
+            return httpx.Response(302, headers={"Location": "https://127.0.0.1/secret"})
+        if "oversized" in url:
+            return httpx.Response(200, content=b"A" * 200)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+
+    # evilsec.gov must not receive sec_user_agent
+    body, _mime = await _download_bytes(
+        "https://evilsec.gov/file.htm",
+        sec_user_agent=SEC_UA,
+        transport=transport,
+        timeout=5.0,
+        resolver=_public_test_resolver,
+    )
+    assert body == b"ok"
+    assert seen_headers.get("user-agent") != SEC_UA
+
+    # Redirect to loopback is blocked
+    with pytest.raises(UnsafeUrlError):
+        await _download_bytes(
+            "https://ir.example.test/redirect-loopback",
+            sec_user_agent=None,
+            transport=transport,
+            timeout=5.0,
+            resolver=_public_test_resolver,
+        )
+
+    # Streaming over max_bytes aborts immediately
+    with pytest.raises(ValueError, match="max_bytes"):
+        await _download_bytes(
+            "https://ir.example.test/oversized",
+            sec_user_agent=None,
+            transport=transport,
+            timeout=5.0,
+            max_bytes=64,
+            resolver=_public_test_resolver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sec_edgar_rejects_traversal_doc_and_earnings_watch_invalid_date() -> None:
+    submissions = {
+        "cik": "0000123456",
+        "filings": {
+            "recent": {
+                "form": ["10-K", "10-K"],
+                "accessionNumber": ["0000123456-26-000001", "not-digits-accn"],
+                "filingDate": ["2026-02-20", "2026-02-20"],
+                "reportDate": ["2025-12-31", "2025-12-31"],
+                "primaryDocument": ["../evil.htm", "ok.htm"],
+                "primaryDocDescription": ["Bad Doc", "Bad Accn"],
+                "items": [[], []],
+            }
+        },
+    }
+    adapter = SecEdgarAdapter(
+        user_agent=SEC_UA,
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json=submissions)),
+        resolver=_public_test_resolver,
+    )
+    company = CompanyTarget(
+        source_key="sec-bad",
+        ticker="BAD",
+        exchange="XNAS",
+        name="Bad Corp",
+        sec_cik=123456,
+        verified_documents=[
+            VerifiedDocumentHint(
+                id="ew-bad-date",
+                event_id="ev-1",
+                url="https://ir.example.test/doc.pdf",
+                title="Release",
+                role="results_release",
+                first_seen="../../pwn",
+            ),
+            VerifiedDocumentHint(
+                id="ew-ssrf",
+                event_id="ev-2",
+                url="http://127.0.0.1/admin",
+                title="SSRF",
+                role="results_release",
+                first_seen="2026-10-01T00:00:00Z",
+            ),
+        ],
+    )
+    assert await adapter.discover(company, today=date(2026, 11, 26)) == []
+
+    ew = EarningsWatchAdapter(resolver=_public_test_resolver)
+    ew_cands = await ew.discover(company, today=date(2026, 11, 26))
+    assert len(ew_cands) == 1
+    assert ew_cands[0].external_id == "ew-bad-date"
+    assert ew_cands[0].filing_date == "undated"
+
+
+def test_export_markdown_sanitizes_traversal_and_rejects_symlinks(tmp_path: Path) -> None:
+    store = FilingsStore(tmp_path / "library.sqlite3")
+    cas = ContentAddressedStore(tmp_path / "cas")
+    try:
+        store.upsert_company(
+            CompanyTarget(source_key="..", ticker="TRV", exchange="XNAS", name="Traversal Co")
+        )
+        raw_sha = cas.put_bytes(b"raw")
+        md_sha = cas.put_bytes(b"# Safe Content\n")
+        doc = DocumentRecord(
+            document_id="../../evil-id",
+            source_key="..",
+            adapter=SourceAdapter.EARNINGS_WATCH,
+            external_id="ext-1",
+            form_type="../../10-K",
+            form_family=FormFamily.ANNUAL_REPORT,
+            title="Test",
+            filing_date="../../pwn",
+            source_url="https://ir.example.test/doc.html",
+            source_sha256=raw_sha,
+            source_mime="text/html",
+            source_bytes=3,
+            markdown_sha256=md_sha,
+        )
+        store.upsert_document(doc)
+        store.replace_sections(
+            doc.document_id,
+            [ExtractedSection(locator="s:1", title="T", ordinal=1, markdown="# Safe Content")],
+        )
+
+        out_dir = tmp_path / "export"
+        written = export_markdown(store, cas, out_dir)
+        assert len(written) == 1
+        assert written[0].resolve().is_relative_to(out_dir.resolve())
+        assert ".." not in written[0].relative_to(out_dir).parts
+
+        # Symlink on out_dir rejected
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        sym_out = tmp_path / "sym_export"
+        sym_out.symlink_to(outside)
+        with pytest.raises(SymlinkRejectedError):
+            export_markdown(store, cas, sym_out)
+
+        # Symlink on issuer_dir rejected
+        sym_parent = tmp_path / "sym_parent"
+        sym_parent.mkdir()
+        (sym_parent / "issuer").symlink_to(outside)
+        with pytest.raises(SymlinkRejectedError):
+            export_markdown(store, cas, sym_parent)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_targets_client_wraps_token_file_errors_as_hub_unavailable(tmp_path: Path) -> None:
+    missing = tmp_path / "nonexistent.token"
+    c_missing = LibraryTargetsClient(base_url="https://hub.example.test", token_file=missing)
+    with pytest.raises(HubUnavailableError) as exc_missing:
+        await c_missing.fetch_targets()
+    assert str(missing) not in str(exc_missing.value)
+    assert "targets bearer token unavailable" in str(exc_missing.value)
+
+    world_readable = tmp_path / "loose.token"
+    world_readable.write_text("secret-value", encoding="utf-8")
+    world_readable.chmod(0o644)
+    c_perm = LibraryTargetsClient(base_url="https://hub.example.test", token_file=world_readable)
+    with pytest.raises(HubUnavailableError) as exc_perm:
+        await c_perm.fetch_targets()
+    assert str(world_readable) not in str(exc_perm.value)
+
+    empty_file = tmp_path / "empty.token"
+    empty_file.write_text("   \n", encoding="utf-8")
+    empty_file.chmod(0o600)
+    c_empty = LibraryTargetsClient(base_url="https://hub.example.test", token_file=empty_file)
+    with pytest.raises(HubUnavailableError) as exc_empty:
+        await c_empty.fetch_targets()
+    assert str(empty_file) not in str(exc_empty.value)

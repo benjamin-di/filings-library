@@ -283,6 +283,99 @@ async def test_http_health_auth_host_and_cache_control(tmp_path: Path) -> None:
                 r_ok = await _mcp_call(client, "filings_list_companies", subject="bob")
                 assert r_ok.status_code == 200
                 assert r_ok.headers.get("cache-control") == "no-store"
+
+                # 8. Non-ASCII bearer token -> 401 with Cache-Control: no-store (never 500 TypeError)
+                r_non_ascii = await client.post(
+                    "/mcp",
+                    headers=httpx.Headers(
+                        [
+                            (b"accept", b"application/json, text/event-stream"),
+                            (b"host", b"testserver"),
+                            (b"authorization", b"Bearer caf\xe9-" + (b"x" * 32)),
+                            (b"x-fleet-subject", b"bob"),
+                        ]
+                    ),
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "filings_list_companies", "arguments": {}},
+                    },
+                )
+                assert r_non_ascii.status_code == 401
+                assert r_non_ascii.headers.get("cache-control") == "no-store"
+
+                # 9. Duplicate Authorization header -> 401 with Cache-Control: no-store
+                r_dup_auth = await client.post(
+                    "/mcp",
+                    headers=[
+                        ("Accept", "application/json, text/event-stream"),
+                        ("Host", "testserver"),
+                        ("Authorization", f"Bearer {VALID_BEARER}"),
+                        ("Authorization", f"Bearer {VALID_BEARER}"),
+                        ("X-Fleet-Subject", "bob"),
+                    ],
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "filings_list_companies", "arguments": {}},
+                    },
+                )
+                assert r_dup_auth.status_code == 401
+                assert r_dup_auth.headers.get("cache-control") == "no-store"
+
+                # 10. Duplicate X-Fleet-Subject header -> 403 with Cache-Control: no-store
+                r_dup_subj = await client.post(
+                    "/mcp",
+                    headers=[
+                        ("Accept", "application/json, text/event-stream"),
+                        ("Host", "testserver"),
+                        ("Authorization", f"Bearer {VALID_BEARER}"),
+                        ("X-Fleet-Subject", "bob"),
+                        ("X-Fleet-Subject", "alice"),
+                    ],
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "filings_list_companies", "arguments": {}},
+                    },
+                )
+                assert r_dup_subj.status_code == 403
+                assert r_dup_subj.headers.get("cache-control") == "no-store"
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_token_file_error_returns_503_without_path_leak(tmp_path: Path) -> None:
+    from filings_library.service import TargetsScopeResolver
+    from filings_library.targets_client import LibraryTargetsClient
+
+    store, cas, _ids = _seed_corpus(tmp_path)
+    missing_token = tmp_path / "secret-dir" / "missing.token"
+    try:
+        targets_client = LibraryTargetsClient(
+            base_url="https://hub.example.test",
+            token_file=missing_token,
+        )
+        service = FilingsService(store, cas, TargetsScopeResolver(targets_client))
+        app = create_http_app(
+            service,
+            backend_bearer_token=VALID_BEARER,
+            allowed_hosts=["testserver"],
+        )
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client:
+                resp = await _mcp_call(client, "filings_list_companies", subject="bob")
+                assert resp.status_code == 503
+                assert resp.headers.get("cache-control") == "no-store"
+                assert str(missing_token) not in resp.text
+                assert resp.json()["detail"] == "targets bearer token unavailable"
     finally:
         store.close()
 
