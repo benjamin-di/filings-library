@@ -60,5 +60,5 @@ jobs:
           IMAGE="ghcr.io/${{ github.repository_owner }}/filings-library@${DIGEST}"
           docker run --rm --platform linux/amd64 --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --tmpfs /data:uid=1001,gid=1001,mode=0700 \
-            --tmpfs /tmp "$IMAGE" filings-library --help >/dev/null
+            --tmpfs /tmp "$IMAGE" --help >/dev/null
           echo "Published: $IMAGE"
