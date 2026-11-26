@@ -1,0 +1,76 @@
+services:
+  filings-extractor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["extractor", "--host", "0.0.0.0", "--port", "8081"]
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /scratch:rw,noexec,nosuid,size=256m
+      - /tmp:rw,noexec,nosuid,size=128m
+    environment:
+      TMPDIR: /scratch
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  filings-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+    volumes:
+      - ./data:/data
+    environment:
+      FILINGS_DATA_DIR: /data
+      FILINGS_TARGETS_URL: ${FILINGS_TARGETS_URL:-http://targets-hub.internal:8000}
+      FILINGS_TARGETS_TOKEN: ${FILINGS_TARGETS_TOKEN:-}
+      FILINGS_BACKEND_BEARER_TOKEN: ${FILINGS_BACKEND_BEARER_TOKEN:-}
+      FILINGS_ALLOWED_HOSTS: ${FILINGS_ALLOWED_HOSTS:-localhost,127.0.0.1,filings-server}
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  filings-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sync"]
+    depends_on:
+      filings-extractor:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+    environment:
+      FILINGS_DATA_DIR: /data
+      FILINGS_EXTRACTOR_URL: http://filings-extractor:8081
+      FILINGS_TARGETS_URL: ${FILINGS_TARGETS_URL:-http://targets-hub.internal:8000}
+      FILINGS_TARGETS_TOKEN: ${FILINGS_TARGETS_TOKEN:-}
+      FILINGS_SEC_USER_AGENT: ${FILINGS_SEC_USER_AGENT:-FilingsLibrary/0.1 (contact@example.com)}
+    restart: "no"
