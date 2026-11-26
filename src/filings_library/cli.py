@@ -467,11 +467,12 @@ def _cmd_backup(args: argparse.Namespace) -> int:
             )
             if final_dir.exists():
                 shutil.rmtree(final_dir)
+            size_bytes = dst_db.stat().st_size
             os.replace(stage_dir, final_dir)
             payload = {
                 "backup_dir": str(final_dir),
                 "sha256": sha,
-                "bytes": dst_db.stat().st_size,
+                "bytes": size_bytes,
             }
             _print_output(
                 payload,

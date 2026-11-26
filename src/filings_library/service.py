@@ -113,12 +113,12 @@ class FilingsService:
         return set(keys)
 
     async def health_check(self) -> bool:
-        """Verify SQLite integrity via `PRAGMA quick_check` off the event loop."""
+        """Verify SQLite liveness via a lightweight `SELECT 1` off the event loop."""
 
         def _check() -> bool:
             try:
-                row = self._store.conn.execute("PRAGMA quick_check;").fetchone()
-                return row is not None and str(row[0]).lower() == "ok"
+                row = self._store.conn.execute("SELECT 1;").fetchone()
+                return row is not None and int(row[0]) == 1
             except Exception:
                 return False
 
