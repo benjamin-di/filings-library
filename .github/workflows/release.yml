@@ -1,0 +1,62 @@
+name: Release
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils qpdf tesseract-ocr
+      - run: make bootstrap
+      - run: make check
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then ver="0.0.0-dev"; fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/filings-library:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/filings-library:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+      - name: Smoke linux/amd64
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/filings-library@${DIGEST}"
+          docker run --rm --platform linux/amd64 --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /data:uid=1001,gid=1001,mode=0700 \
+            --tmpfs /tmp "$IMAGE" filings-library --help >/dev/null
+          echo "Published: $IMAGE"

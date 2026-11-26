@@ -1,0 +1,16 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils qpdf tesseract-ocr
+      - run: make bootstrap
+      - run: make check
