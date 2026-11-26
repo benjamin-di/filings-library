@@ -49,8 +49,8 @@ _ADAPTER_ALLOWED_HOSTS: dict[SourceAdapter, frozenset[str] | None] = {
 class SyncConfig:
     backfill_years: int = 3
     global_cap_bytes: int = DEFAULT_GLOBAL_CAP_BYTES
-    per_issuer_cap_bytes: int = 512 * 1024 * 1024  # 512 MiB
-    per_issuer_max_docs: int = 200
+    per_issuer_cap_bytes: int = 5 * 1024 * 1024 * 1024  # 5 GiB
+    per_issuer_max_docs: int = 500
     sec_user_agent: str | None = None
     download_timeout: float = 60.0
     max_download_bytes: int = MAX_EXTRACT_BYTES

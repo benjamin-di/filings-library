@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from datetime import date, datetime, timedelta
@@ -64,15 +65,21 @@ _OFFERING_T2 = frozenset({"20100", "51500"})
 _HKEX_DATE_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
 
 
-def is_kept_hkex_filing(t1code: str, t2code: str, title: str) -> tuple[bool, FormFamily]:
+def is_kept_hkex_filing(
+    t1code: str, t2code: str, title: str, long_text: str = ""
+) -> tuple[bool, FormFamily]:
     """Return `(kept, form_family)` enforcing strict HKEX noise rejection."""
     t1 = str(t1code or "").strip()
     t2 = str(t2code or "").strip()
-    lower_title = (title or "").strip().lower()
+    lower_title = html.unescape(title or "").strip().lower()
+    lower_long = html.unescape(long_text or "").strip().lower()
+    combined = f"{lower_long} {lower_title}"
 
     if t1 in _REJECTED_T1_CODES or t2 in _REJECTED_T2_CODES:
         return False, FormFamily.OTHER
-    if any(noise in lower_title for noise in _REJECTED_TITLE_SUBSTRINGS):
+    if any(noise in combined for noise in _REJECTED_TITLE_SUBSTRINGS):
+        return False, FormFamily.OTHER
+    if "monthly returns" in lower_long or "next day disclosure" in lower_long:
         return False, FormFamily.OTHER
 
     if t2 in _FINANCIAL_STATEMENTS_T2:
@@ -92,6 +99,31 @@ def is_kept_hkex_filing(t1code: str, t2code: str, title: str) -> tuple[bool, For
 
     if t1 in _OFFERING_T1 or t2 in _OFFERING_T2:
         return True, FormFamily.OFFERING
+
+    # Live HKEXnews titleSearchServlet.do returns category labels in LONG_TEXT/SHORT_TEXT
+    # rather than numeric T1_CODE/T2_CODE fields.
+    if lower_long:
+        if "financial statements" in lower_long or "esg information" in lower_long:
+            if "interim" in lower_long or "half-year" in lower_long or "interim" in lower_title:
+                return True, FormFamily.INTERIM_REPORT
+            if "quarter" in lower_long or "quarter" in lower_title:
+                return True, FormFamily.QUARTERLY_REPORT
+            return True, FormFamily.ANNUAL_REPORT
+        if any(
+            marker in lower_long
+            for marker in (
+                "final results",
+                "annual results",
+                "interim results",
+                "quarterly results",
+                "results announcement",
+            )
+        ):
+            return True, FormFamily.RESULTS_RELEASE
+        if lower_long.startswith("circulars"):
+            return True, FormFamily.CIRCULAR
+        if "listing documents" in lower_long or "prospectus" in lower_long:
+            return True, FormFamily.OFFERING
 
     return False, FormFamily.OTHER
 
@@ -211,8 +243,9 @@ class HkexnewsAdapter:
                 continue
             t1 = str(rec.get("t1_code") or rec.get("T1_CODE") or rec.get("t1code") or "")
             t2 = str(rec.get("t2_code") or rec.get("T2_CODE") or rec.get("t2code") or "")
-            title = str(rec.get("TITLE") or rec.get("title") or "").strip()
-            kept, form_family = is_kept_hkex_filing(t1, t2, title)
+            title = html.unescape(str(rec.get("TITLE") or rec.get("title") or "")).strip()
+            long_text = str(rec.get("LONG_TEXT") or rec.get("SHORT_TEXT") or "").strip()
+            kept, form_family = is_kept_hkex_filing(t1, t2, title, long_text=long_text)
             if not kept:
                 continue
 

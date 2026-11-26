@@ -420,6 +420,7 @@ def _cmd_rebuild_fts(args: argparse.Namespace) -> int:
 
 
 def _cmd_backup(args: argparse.Namespace) -> int:
+    import fcntl
     import hashlib
     import shutil
     import sqlite3
@@ -434,48 +435,58 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     if out_root.is_symlink():
         raise ValueError("backup out_dir must not be a symlink")
     out_root.mkdir(parents=True, exist_ok=True)
-    day = datetime.now(UTC).strftime("%Y-%m-%d")
-    final_dir = out_root / day
-    stage_dir = Path(tempfile.mkdtemp(prefix=f".backup-{day}-", dir=out_root))
+    lock_fd = open(out_root / ".backup.lock", "w", encoding="utf-8")
     try:
-        dst_db = stage_dir / "filings.sqlite3"
-        src_conn = sqlite3.connect(f"file:{src_db}?mode=ro", uri=True, timeout=10.0)
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        day = datetime.now(UTC).strftime("%Y-%m-%d")
+        final_dir = out_root / day
+        stage_dir = Path(tempfile.mkdtemp(prefix=f".backup-{day}-", dir=out_root))
         try:
-            dst_conn = sqlite3.connect(dst_db)
+            dst_db = stage_dir / "filings.sqlite3"
+            src_conn = sqlite3.connect(f"file:{src_db}?mode=ro", uri=True, timeout=10.0)
             try:
-                src_conn.backup(dst_conn)
-                check = dst_conn.execute("PRAGMA quick_check").fetchone()
-                if not check or check[0] != "ok":
-                    raise RuntimeError(f"Backup integrity check failed: {check}")
+                dst_conn = sqlite3.connect(dst_db)
+                try:
+                    src_conn.backup(dst_conn)
+                    check = dst_conn.execute("PRAGMA quick_check").fetchone()
+                    if not check or check[0] != "ok":
+                        raise RuntimeError(f"Backup integrity check failed: {check}")
+                finally:
+                    dst_conn.close()
             finally:
-                dst_conn.close()
-        finally:
-            src_conn.close()
-        sha = hashlib.sha256(dst_db.read_bytes()).hexdigest()
-        manifest = {
-            "schema": 1,
-            "created_at": datetime.now(UTC).isoformat(),
-            "day": day,
-            "files": {"filings.sqlite3": {"sha256": sha, "bytes": dst_db.stat().st_size}},
-        }
-        (stage_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        if final_dir.exists():
-            shutil.rmtree(final_dir)
-        os.replace(stage_dir, final_dir)
-        payload = {"backup_dir": str(final_dir), "sha256": sha, "bytes": dst_db.stat().st_size}
-        _print_output(
-            payload,
-            as_json=args.as_json,
-            text_formatter=lambda d: (
-                f"Backed up SQLite DB to {d['backup_dir']} ({d['bytes']} bytes)"
-            ),
-        )
-        return 0
-    except Exception:
-        shutil.rmtree(stage_dir, ignore_errors=True)
-        raise
+                src_conn.close()
+            sha = hashlib.sha256(dst_db.read_bytes()).hexdigest()
+            manifest = {
+                "schema": 1,
+                "created_at": datetime.now(UTC).isoformat(),
+                "day": day,
+                "files": {"filings.sqlite3": {"sha256": sha, "bytes": dst_db.stat().st_size}},
+            }
+            (stage_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
+            os.replace(stage_dir, final_dir)
+            payload = {
+                "backup_dir": str(final_dir),
+                "sha256": sha,
+                "bytes": dst_db.stat().st_size,
+            }
+            _print_output(
+                payload,
+                as_json=args.as_json,
+                text_formatter=lambda d: (
+                    f"Backed up SQLite DB to {d['backup_dir']} ({d['bytes']} bytes)"
+                ),
+            )
+            return 0
+        except Exception:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
+    finally:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:

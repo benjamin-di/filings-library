@@ -18,7 +18,7 @@ from filings_library.extractor.pdf_extract import EncryptedPdfError, extract_pdf
 from filings_library.extractor.xlsx_extract import extract_xlsx
 from filings_library.models import ExtractedDocument
 
-MAX_EXTRACT_BYTES = 100 * 1024 * 1024  # 100 MiB
+MAX_EXTRACT_BYTES = 250 * 1024 * 1024  # 250 MiB
 
 
 def _detect_kind(mime_type: str, filename: str) -> str | None:
