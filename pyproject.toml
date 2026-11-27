@@ -21,6 +21,7 @@ dependencies = [
     "starlette>=1.0,<2",
     "uvicorn>=0.30,<1",
     "signin-window[oidc]==0.13.0",
+    "issuer-sources @ https://github.com/benjamin-di/issuer-sources/archive/refs/tags/v0.1.0.tar.gz",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +46,9 @@ dev = [
     "mypy>=1.18,<2",
     "types-beautifulsoup4",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/filings_library"]

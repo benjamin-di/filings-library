@@ -702,6 +702,33 @@ class FilingsStore:
             assert cur.lastrowid is not None
             return int(cur.lastrowid)
 
+    def enqueue_job_if_absent(
+        self, kind: str, payload: dict[str, Any], *, max_attempts: int = 3
+    ) -> int | None:
+        """Enqueue a pending/leased job only if no active job with identical kind+payload exists."""
+        payload_json = json.dumps(payload, sort_keys=True)
+        now = utc_now_iso()
+        with self._tx():
+            existing = self._conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE kind = ? AND payload_json = ? AND status IN ('pending', 'leased')
+                LIMIT 1
+                """,
+                (kind, payload_json),
+            ).fetchone()
+            if existing is not None:
+                return None
+            cur = self._conn.execute(
+                """
+                INSERT INTO jobs(kind, payload_json, status, attempts, max_attempts, created_at, updated_at)
+                VALUES (?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (kind, payload_json, max(1, max_attempts), now, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
     def lease_job(
         self, owner: str, *, lease_seconds: int = 300, now: datetime | None = None
     ) -> dict[str, Any] | None:

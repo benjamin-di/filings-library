@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from datetime import date
 
+from issuer_sources.model import DocumentCategory, normalize_document_category
+
 from filings_library.adapters import FilingCandidate
 from filings_library.models import CompanyTarget, FormFamily, SourceAdapter
 from filings_library.url_safety import (
@@ -15,17 +17,19 @@ from filings_library.url_safety import (
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-_ROLE_TO_FAMILY: dict[str, FormFamily] = {
-    "results_release": FormFamily.RESULTS_RELEASE,
-    "earnings_release": FormFamily.RESULTS_RELEASE,
-    "press_release": FormFamily.RESULTS_RELEASE,
-    "presentation": FormFamily.PRESENTATION,
-    "slides": FormFamily.PRESENTATION,
-    "databook": FormFamily.DATABOOK,
-    "spreadsheet": FormFamily.DATABOOK,
-    "annual_report": FormFamily.ANNUAL_REPORT,
-    "interim_report": FormFamily.INTERIM_REPORT,
-    "quarterly_report": FormFamily.QUARTERLY_REPORT,
+_CATEGORY_TO_FAMILY: dict[DocumentCategory, FormFamily] = {
+    DocumentCategory.RESULTS_RELEASE: FormFamily.RESULTS_RELEASE,
+    DocumentCategory.FINANCIAL_STATEMENTS: FormFamily.FINANCIAL_STATEMENTS,
+    DocumentCategory.PRESENTATION: FormFamily.PRESENTATION,
+    DocumentCategory.TRANSCRIPT: FormFamily.TRANSCRIPT,
+    DocumentCategory.DATABOOK: FormFamily.DATABOOK,
+    DocumentCategory.ANNUAL_REPORT: FormFamily.ANNUAL_REPORT,
+    DocumentCategory.INTERIM_REPORT: FormFamily.INTERIM_REPORT,
+    DocumentCategory.QUARTERLY_REPORT: FormFamily.QUARTERLY_REPORT,
+    DocumentCategory.CURRENT_REPORT: FormFamily.CURRENT_REPORT,
+    DocumentCategory.PROXY: FormFamily.PROXY,
+    DocumentCategory.CIRCULAR: FormFamily.CIRCULAR,
+    DocumentCategory.OFFERING: FormFamily.OFFERING,
 }
 
 
@@ -73,8 +77,8 @@ class EarningsWatchAdapter:
                 safe_url = validate_public_https_url(raw_url, resolver=self._resolver)
             except UnsafeUrlError:
                 continue
-            role_key = (hint.role or "other").strip().lower()
-            form_family = _ROLE_TO_FAMILY.get(role_key, FormFamily.RESULTS_RELEASE)
+            category = normalize_document_category(hint.category or hint.role or "other")
+            form_family = _CATEGORY_TO_FAMILY.get(category, FormFamily.RESULTS_RELEASE)
             fdate = _parse_iso_date(hint.first_seen)
             candidates.append(
                 FilingCandidate(

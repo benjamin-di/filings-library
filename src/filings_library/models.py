@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class FormFamily(StrEnum):
@@ -13,11 +13,13 @@ class FormFamily(StrEnum):
     INTERIM_REPORT = "interim_report"
     QUARTERLY_REPORT = "quarterly_report"
     RESULTS_RELEASE = "results_release"
+    FINANCIAL_STATEMENTS = "financial_statements"
     CURRENT_REPORT = "current_report"
     PROXY = "proxy"
     OFFERING = "offering"
     CIRCULAR = "circular"
     PRESENTATION = "presentation"
+    TRANSCRIPT = "transcript"
     DATABOOK = "databook"
     OTHER = "other"
 
@@ -34,6 +36,7 @@ class SourceAdapter(StrEnum):
     HKEXNEWS = "hkexnews"
     ESEF_XBRL = "esef_xbrl"
     EARNINGS_WATCH = "earnings_watch"
+    ISSUER_IR = "issuer_ir"
 
 
 class VerifiedDocumentHint(BaseModel):
@@ -43,6 +46,7 @@ class VerifiedDocumentHint(BaseModel):
     url: str
     title: str = ""
     role: str = "other"
+    category: str = ""
     first_seen: str = ""
 
 
@@ -56,8 +60,36 @@ class CompanyTarget(BaseModel):
     sec_cik: int | None = None
     hkex_stock_id: str | None = None
     lei: str | None = None
+    fy_end_month: int = 12
+    period_scheme: str = "calendar-q"
     ir_urls: list[str] = Field(default_factory=list)
     verified_documents: list[VerifiedDocumentHint] = Field(default_factory=list)
+
+    @field_validator("ir_urls", mode="before")
+    @classmethod
+    def _coerce_ir_urls(cls, value: object) -> list[str]:
+        if isinstance(value, dict):
+            urls: list[str] = []
+            for key in (
+                "calendar",
+                "results",
+                "announcements",
+                "presentations",
+                "transcripts",
+                "archive",
+            ):
+                raw = value.get(key)
+                if isinstance(raw, str) and raw.strip() and raw.strip() not in urls:
+                    urls.append(raw.strip())
+            extra = value.get("extra")
+            if isinstance(extra, list):
+                for item in extra:
+                    if isinstance(item, str) and item.strip() and item.strip() not in urls:
+                        urls.append(item.strip())
+            return urls
+        if isinstance(value, list):
+            return [str(u).strip() for u in value if str(u).strip()]
+        return []
 
 
 class PersonScope(BaseModel):

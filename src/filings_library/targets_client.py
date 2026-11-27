@@ -112,7 +112,7 @@ class LibraryTargetsClient:
         except (ValueError, ValidationError) as exc:
             raise HubUnavailableError(f"Invalid targets payload from hub: {exc}") from exc
 
-        if payload.schema_version != 1:
+        if payload.schema_version not in {1, 2}:
             raise HubUnavailableError(
                 f"Unsupported targets payload schema version: {payload.schema_version}"
             )

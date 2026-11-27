@@ -19,6 +19,7 @@ from filings_library.adapters import FilingCandidate
 from filings_library.adapters.earnings_watch import EarningsWatchAdapter
 from filings_library.adapters.esef_xbrl import EsefXbrlAdapter
 from filings_library.adapters.hkexnews import HkexnewsAdapter
+from filings_library.adapters.issuer_ir import IssuerIrAdapter
 from filings_library.adapters.sec_edgar import SecEdgarAdapter
 from filings_library.cas import ContentAddressedStore, SymlinkRejectedError
 from filings_library.extractor.app import MAX_EXTRACT_BYTES, ExtractorClient
@@ -42,6 +43,7 @@ _ADAPTER_ALLOWED_HOSTS: dict[SourceAdapter, frozenset[str] | None] = {
     SourceAdapter.HKEXNEWS: HKEX_ALLOWED_HOSTS,
     SourceAdapter.ESEF_XBRL: ESEF_ALLOWED_HOSTS,
     SourceAdapter.EARNINGS_WATCH: None,
+    SourceAdapter.ISSUER_IR: None,
 }
 
 
@@ -163,6 +165,7 @@ async def sync_once(
     hkex_adapter: HkexnewsAdapter | None = None,
     esef_adapter: EsefXbrlAdapter | None = None,
     earnings_watch_adapter: EarningsWatchAdapter | None = None,
+    issuer_ir_adapter: IssuerIrAdapter | None = None,
     download_transport: httpx.AsyncBaseTransport | None = None,
     url_resolver: HostResolver | None = None,
     today: date | None = None,
@@ -192,6 +195,10 @@ async def sync_once(
         transport=download_transport,
         resolver=url_resolver,
     )
+    issuer_ir = issuer_ir_adapter or IssuerIrAdapter(
+        transport=download_transport,
+        resolver=url_resolver,
+    )
 
     sec_ua = sec.user_agent if sec is not None else cfg.sec_user_agent
 
@@ -200,12 +207,15 @@ async def sync_once(
         result.companies_synced += 1
 
         candidates: list[FilingCandidate] = []
-        # Priority order: release-day fast path first, then Tier 1/2 official adapters.
+        # Priority order: release-day fast path first, then Tier 1/2 official adapters,
+        # then deterministic IR link harvesting.
         adapter_list: list[tuple[str, object]] = [("earnings_watch", ew)]
         if sec is not None:
             adapter_list.append(("sec_edgar", sec))
         adapter_list.append(("hkexnews", hkex))
         adapter_list.append(("esef_xbrl", esef))
+        if company.ir_urls:
+            adapter_list.append(("issuer_ir", issuer_ir))
 
         for adapter_name, adapter in adapter_list:
             try:
@@ -213,6 +223,12 @@ async def sync_once(
                 candidates.extend(discovered)
             except Exception as exc:
                 result.errors.append(f"{company.source_key}/{adapter_name}: {exc}")
+
+        if not candidates and store.count_documents_for_issuer(company.source_key) == 0:
+            store.enqueue_job_if_absent(
+                "ir_gap_backfill",
+                {"source_key": company.source_key, "ticker": company.ticker},
+            )
 
         # Process older filings before amendments so supersession links resolve cleanly.
         candidates.sort(key=lambda c: (c.is_amendment, c.filing_date, c.external_id))
