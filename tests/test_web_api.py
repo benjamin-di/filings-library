@@ -745,7 +745,7 @@ def test_cli_serve_configures_browser_auth_root_home(
         return orig_create(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(cli, "create_http_app", _capture_create_http_app)
-    monkeypatch.setattr(uvicorn, "run", lambda app, host, port: None)
+    monkeypatch.setattr(uvicorn, "run", lambda app, host, port, **kwargs: captured.update(kwargs))
 
     rc = cli.main(
         [

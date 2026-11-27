@@ -563,7 +563,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             browser_auth=browser_auth,
             public_base_url=public_url,
         )
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=65)
         return 0
     finally:
         store.close()
@@ -571,7 +571,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 def _cmd_extractor(args: argparse.Namespace) -> int:
     app = create_extractor_app()
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=65)
     return 0
 
 
