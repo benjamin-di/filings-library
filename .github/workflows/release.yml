@@ -62,3 +62,42 @@ jobs:
             --security-opt no-new-privileges --tmpfs /data:uid=1001,gid=1001,mode=0700 \
             --tmpfs /tmp "$IMAGE" --help >/dev/null
           echo "Published: $IMAGE"
+      - name: Record digest
+        if: github.ref_type == 'tag'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > digests/filings-library
+      - name: Upload digest
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-filings-library
+          path: digests/filings-library
+
+  publish-release:
+    needs: image
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: digest-filings-library
+          path: digests
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+            exit 0
+          fi
+          digest="$(cat digests/filings-library)"
+          version="${GITHUB_REF_NAME#v}"
+          notes="$(printf 'Multi-arch container image (linux/amd64, linux/arm64):\n\n- `ghcr.io/%s/filings-library:%s@%s`\n' \
+            "${GITHUB_REPOSITORY_OWNER}" "$version" "$digest")"
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$notes"
