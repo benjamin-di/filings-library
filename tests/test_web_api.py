@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from starlette.requests import Request
 from starlette.testclient import TestClient
 
@@ -478,3 +479,172 @@ def test_xbrl_comparative_years_q4_filter_asc606_and_xlsx_filename() -> None:
     stmts_bs = build_xbrl_statements(facts_bs, doc_id_by_accn={})
     assert stmts_bs["rows"][0]["values"]["FY2025"]["end"] == "2025-12-31"
     assert stmts_bs["rows"][0]["values"]["FY2025"]["val"] == 45_000_000_000
+
+
+def test_suite_switcher_payload_and_auxiliary_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    from signin_window.connections import SCRIPT_SOURCE, SuiteDirectory
+    from signin_window.oidc import BrowserAuth, OIDCConfig
+
+    svc, _, _, _ = _seed_service(tmp_path)
+    directory = SuiteDirectory.from_json(
+        json.dumps(
+            {
+                "name": "Connect",
+                "endpoint": {
+                    "title": "Assistant address",
+                    "url": "https://mcp.example.com/mcp",
+                    "help": "Copy into your assistant.",
+                },
+                "apps": [
+                    {
+                        "label": "Filings",
+                        "url": "https://filings.example.com/",
+                        "section": "Workspaces",
+                        "description": "Read and compare company filings",
+                        "groups": ["filings"],
+                        "endpoint": True,
+                    },
+                    {
+                        "label": "Household",
+                        "url": "https://household.example.com/",
+                        "section": "Workspaces",
+                        "description": "Net worth, spending and review",
+                        "groups": ["household"],
+                    },
+                    {
+                        "label": "Admin",
+                        "url": "https://admin.example.com/",
+                        "section": "Tools",
+                        "description": "Restricted admin console",
+                        "groups": ["admins"],
+                    },
+                ],
+            }
+        )
+    )
+
+    state_dir = tmp_path / "browser"
+    auth = BrowserAuth(
+        OIDCConfig(
+            issuer="https://idp.example.com",
+            client_id="filings-web",
+            public_url="https://filings.example.com",
+            state_dir=state_dir,
+            required_group="filings",
+            cookie_name="__Host-filings",
+            allow_loopback_http=True,
+        ),
+        suite=directory,
+    )
+    sid = "A" * 43
+    auth.store.save(
+        sid,
+        {
+            "issuer": "https://idp.example.com",
+            "sub": "sub-alice",
+            "name": "Alex Example",
+            "label": "Alex Example",
+            "groups": ["filings", "household"],
+            "claims": {"person_id": "alex"},
+            "expires": time.time() + 3600,
+        },
+    )
+
+    app = create_http_app(
+        svc,
+        backend_bearer_token=BEARER,
+        allowed_hosts=["testserver", "localhost"],
+        browser_auth=auth,
+        public_base_url="https://filings.example.com",
+    )
+    client = TestClient(app)
+
+    # Unauthenticated /api/me stays fail-closed 401
+    assert client.get("/api/me").status_code == 401
+
+    client.cookies.set(auth.cookie, sid)
+    me_resp = client.get("/api/me")
+    assert me_resp.status_code == 200
+    me = me_resp.json()
+    assert me["has_logout"] is True
+    suite = me["suite"]
+    assert suite is not None
+    assert suite["name"] == "Connect"
+    assert suite["account"] == "Alex Example"
+    assert "endpoint" not in suite
+    labels = [link["label"] for link in suite["links"]]
+    assert labels == ["Filings", "Household"]
+    assert suite["links"][0]["current"] is True
+    assert suite["links"][1]["current"] is False
+    assert suite["links"][1]["section"] == "Workspaces"
+    assert suite["links"][1]["url"] == "https://household.example.com/"
+
+    # SPA shell has the switcher container hidden by default, accessible labels, and strict CSP
+    spa = client.get("/")
+    assert spa.status_code == 200
+    assert 'id="suite-nav"' in spa.text
+    assert 'aria-label="Your apps"' in spa.text
+    assert '<summary aria-label="Apps">' in spa.text
+    assert 'class="suite-mark h1"' in spa.text
+    spa_csp = spa.headers["content-security-policy"]
+    assert "script-src 'self';" in spa_csp
+    assert "style-src 'self' 'unsafe-inline';" in spa_csp
+
+    # Server-rendered 503 fallback uses signin_window.connections.page() with suite= and PAGE_HEADERS
+    empty_static = tmp_path / "empty_static"
+    empty_static.mkdir()
+    app_missing = create_http_app(
+        svc,
+        backend_bearer_token=BEARER,
+        allowed_hosts=["testserver", "localhost"],
+        browser_auth=auth,
+        public_base_url="https://filings.example.com",
+        static_dir=empty_static,
+    )
+    client_missing = TestClient(app_missing)
+    client_missing.cookies.set(auth.cookie, sid)
+    fallback = client_missing.get("/")
+    assert fallback.status_code == 503
+    assert '<details class="suite-switch">' in fallback.text
+    assert "https://household.example.com/" in fallback.text
+    fallback_csp = fallback.headers["content-security-policy"]
+    assert f"script-src {SCRIPT_SOURCE};" in fallback_csp
+    assert "style-src 'self' 'unsafe-inline';" in fallback_csp
+
+    # Unset or malformed SIGNIN_WINDOW_SUITE renders no switcher without error
+    for env_val in (None, "{not-valid-json"):
+        if env_val is None:
+            monkeypatch.delenv("SIGNIN_WINDOW_SUITE", raising=False)
+        else:
+            monkeypatch.setenv("SIGNIN_WINDOW_SUITE", env_val)
+        auth_no_suite = BrowserAuth(
+            OIDCConfig(
+                issuer="https://idp.example.com",
+                client_id="filings-web",
+                public_url="https://filings.example.com",
+                state_dir=state_dir,
+                required_group="filings",
+                cookie_name="__Host-filings",
+                allow_loopback_http=True,
+            ),
+        )
+        app_no_suite = create_http_app(
+            svc,
+            backend_bearer_token=BEARER,
+            allowed_hosts=["testserver", "localhost"],
+            browser_auth=auth_no_suite,
+            public_base_url="https://filings.example.com",
+            static_dir=empty_static,
+        )
+        client_no_suite = TestClient(app_no_suite)
+        client_no_suite.cookies.set(auth_no_suite.cookie, sid)
+        me_no_suite = client_no_suite.get("/api/me")
+        assert me_no_suite.status_code == 200
+        assert me_no_suite.json()["suite"] is None
+        fallback_no_suite = client_no_suite.get("/")
+        assert fallback_no_suite.status_code == 503
+        assert '<details class="suite-switch">' not in fallback_no_suite.text

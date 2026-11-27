@@ -250,14 +250,112 @@ function updateUrl(replace = false) {
 
 function syncNavTabs() {
   document.querySelectorAll(".nav-tab").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === state.view);
+    const active = btn.dataset.view === state.view;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
   });
   const label = document.getElementById("cmd-trigger-label");
   if (state.activeQuery) {
-    label.innerHTML = `Search: <strong style="color:var(--amber)">${esc(state.activeQuery)}</strong>`;
+    label.innerHTML = `Search: <strong class="cmd-query-active">${esc(state.activeQuery)}</strong>`;
   } else {
     label.textContent = `Search ${state.me ? state.me.total_documents.toLocaleString() : ""} filings, tickers, phrases…`;
   }
+}
+
+/* ==================== SUITE SWITCHER ==================== */
+function isSafeHttpsUrl(value) {
+  if (typeof value !== "string" || !value.startsWith("https://") || value.includes("#")) {
+    return false;
+  }
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code <= 32 || code === 127 || value[i] === "\\") return false;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function createSuiteMark(label, small = false) {
+  const text = String(label || "").trim() || "?";
+  const bytes = new TextEncoder().encode(text.toLowerCase());
+  let sum = 0;
+  for (const b of bytes) sum += b;
+  const hue = sum % 9;
+  const span = document.createElement("span");
+  span.className = `suite-mark${hue ? ` h${hue}` : ""}${small ? " sm" : ""}`;
+  span.setAttribute("aria-hidden", "true");
+  span.textContent = text[0];
+  return span;
+}
+
+function renderSuiteSwitcher(suite) {
+  const nav = document.getElementById("suite-nav");
+  const menu = document.getElementById("suite-menu");
+  const brandSub = document.getElementById("brand-sub");
+  if (!nav || !menu) return;
+
+  menu.replaceChildren();
+  if (!suite || !Array.isArray(suite.links)) {
+    nav.hidden = true;
+    return;
+  }
+  if (brandSub && typeof suite.name === "string" && suite.name.trim()) {
+    brandSub.textContent = suite.name.trim();
+  }
+
+  const validLinks = suite.links.filter(
+    (link) =>
+      link &&
+      typeof link.label === "string" &&
+      link.label.trim() &&
+      isSafeHttpsUrl(link.url)
+  );
+  const others = validLinks.filter((link) => !link.current);
+  if (!others.length) {
+    nav.hidden = true;
+    return;
+  }
+
+  const sections = new Map();
+  for (const link of validLinks) {
+    const sec = typeof link.section === "string" ? link.section.trim() : "";
+    if (!sections.has(sec)) sections.set(sec, []);
+    sections.get(sec).push(link);
+  }
+
+  for (const [section, links] of sections.entries()) {
+    if (section) {
+      const h2 = document.createElement("h2");
+      h2.textContent = section;
+      menu.appendChild(h2);
+    }
+    const ul = document.createElement("ul");
+    for (const link of links) {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = link.url;
+      if (link.current) a.setAttribute("aria-current", "page");
+      a.appendChild(createSuiteMark(link.label, true));
+      const textWrap = document.createElement("span");
+      const title = document.createElement("b");
+      title.textContent = link.label.trim();
+      textWrap.appendChild(title);
+      if (typeof link.description === "string" && link.description.trim()) {
+        const desc = document.createElement("small");
+        desc.textContent = link.description.trim();
+        textWrap.appendChild(desc);
+      }
+      a.appendChild(textWrap);
+      li.appendChild(a);
+      ul.appendChild(li);
+    }
+    menu.appendChild(ul);
+  }
+  nav.hidden = false;
 }
 
 /* ==================== COMPANIES MATRIX VIEW ==================== */
@@ -692,8 +790,8 @@ function renderRedlineDrawer(doc) {
         )
         .join("")}
     </select>
-    <div style="display:flex;align-items:center;justify-content:space-between;font-size:12px;">
-      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+    <div class="diff-controls-row">
+      <label class="diff-toggle">
         <input type="checkbox" id="diff-changes-only" ${state.diffChangesOnly ? "checked" : ""} />
         Changes only
       </label>
@@ -789,7 +887,7 @@ function renderXbrlView(xbrlCompanies) {
           <div class="doc-sub">Annual US-GAAP / IFRS facts from SEC companyfacts · Click any figure to open its source filing</div>
         </div>
         <div class="toolbar-actions">
-          <select id="xbrl-company-select" class="select-input" style="width:240px;">
+          <select id="xbrl-company-select" class="select-input xbrl-select">
             ${xbrlCompanies
               .map(
                 (c) =>
@@ -898,7 +996,7 @@ async function runCmdSearch() {
     return;
   }
 
-  resultsEl.innerHTML = `<div class="loading-state" style="padding:18px;">Searching filings…</div>`;
+  resultsEl.innerHTML = `<div class="loading-state cmd-status">Searching filings…</div>`;
   const qs = new URLSearchParams({ q, limit: "25" });
   if (compFilter) qs.set("source_key", compFilter);
   if (famFilter) qs.set("form_family", famFilter);
@@ -939,7 +1037,7 @@ async function runCmdSearch() {
 function renderCmdResults() {
   const el = document.getElementById("cmd-results");
   if (!state.cmdItems.length) {
-    el.innerHTML = `<div class="empty-state" style="padding:20px;">No matching filings or companies.</div>`;
+    el.innerHTML = `<div class="empty-state cmd-status">No matching filings or companies.</div>`;
     return;
   }
   el.innerHTML = state.cmdItems
@@ -958,7 +1056,7 @@ function renderCmdResults() {
           <div class="cmd-item-head">
             <span class="badge badge-amber">${esc(item.source_key)}</span>
             <span class="badge badge-blue">${esc(item.form)}</span>
-            <span class="mono" style="font-size:11px;color:var(--text-muted)">${esc(item.date)} · ${esc(item.locator)}</span>
+            <span class="mono cmd-item-meta">${esc(item.date)} · ${esc(item.locator)}</span>
           </div>
           <div class="cmd-item-snippet">${highlightRaw(item.snippet, item.query)}</div>
         </div>
@@ -1011,7 +1109,11 @@ async function init() {
     state.companies = compData.companies || [];
 
     document.getElementById("coverage-badge").textContent = `${me.covered_companies}/${me.company_count} live`;
-    document.getElementById("user-label").textContent = me.person_id || me.name;
+    const accountLabel = (me.suite && me.suite.account) || me.person_id || me.name || "";
+    document.getElementById("user-label").textContent = accountLabel;
+    const avatarEl = document.getElementById("user-avatar");
+    if (avatarEl) avatarEl.textContent = accountLabel.trim() ? accountLabel.trim()[0] : "";
+    renderSuiteSwitcher(me.suite);
     if (me.has_logout) {
       document.getElementById("logout-form").classList.remove("hidden");
     }
@@ -1062,7 +1164,21 @@ document.querySelectorAll(".nav-tab").forEach((btn) => {
   });
 });
 
+document.addEventListener("click", (e) => {
+  const switcher = document.getElementById("suite-switch");
+  if (switcher && switcher.open && !switcher.contains(e.target)) {
+    switcher.open = false;
+  }
+});
+
 document.addEventListener("keydown", (e) => {
+  const switcher = document.getElementById("suite-switch");
+  if (e.key === "Escape" && switcher && switcher.open) {
+    e.preventDefault();
+    switcher.open = false;
+    switcher.querySelector("summary")?.focus();
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
     e.preventDefault();
     if (state.cmdOpen) closeCmdPalette();

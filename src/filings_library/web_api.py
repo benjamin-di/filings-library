@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from signin_window.oidc import BrowserAuth
+from signin_window.connections import Suite
+from signin_window.connections import page as connection_page
+from signin_window.oidc import PAGE_HEADERS, BrowserAuth
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import BaseRoute, Route
@@ -500,6 +502,26 @@ def _sanitize_download_filename(doc: DocumentRecord) -> str:
 WebAuthResolver = Callable[[Request], dict[str, Any] | None]
 
 
+def _serialize_suite(suite: Suite | None) -> dict[str, Any] | None:
+    """Serialize a visitor's suite navigation to plain JSON without endpoint rows."""
+    if suite is None:
+        return None
+    return {
+        "name": suite.name,
+        "account": suite.account,
+        "links": [
+            {
+                "label": link.label,
+                "url": link.url,
+                "section": link.section,
+                "description": link.description,
+                "current": link.current,
+            }
+            for link in suite.links
+        ],
+    }
+
+
 def build_web_routes(
     service: FilingsService,
     *,
@@ -548,16 +570,22 @@ def build_web_routes(
             return _json({"error": "hub_unavailable", "detail": str(exc)}, 503)
         raw_claims = who.get("claims")
         claims: dict[str, Any] = raw_claims if isinstance(raw_claims, dict) else {}
+        suite_payload = (
+            _serialize_suite(browser_auth.suite(request)) if browser_auth is not None else None
+        )
         return _json(
             {
                 "subject": subject,
-                "name": str(who.get("name") or claims.get("person_id") or "User"),
+                "name": str(
+                    who.get("label") or who.get("name") or claims.get("person_id") or "User"
+                ),
                 "person_id": str(claims.get("person_id") or ""),
                 "company_count": st["company_count"],
                 "covered_companies": sum(1 for c in st["companies"] if c["document_count"] > 0),
                 "total_documents": sum(int(c["document_count"]) for c in st["companies"]),
                 "public_base_url": public_base_url or "",
                 "has_logout": browser_auth is not None,
+                "suite": suite_payload,
             }
         )
 
@@ -950,10 +978,13 @@ def build_web_routes(
         index_file = resolved_static / "index.html"
         if not index_file.is_file():
             return HTMLResponse(
-                "<!doctype html><title>Filings Library</title>"
-                "<p>Web workspace assets are not built.</p>",
+                connection_page(
+                    "Filings Library",
+                    "<article><p>Web workspace assets are not built.</p></article>",
+                    suite=browser_auth.suite(request) if browser_auth is not None else None,
+                ),
                 status_code=503,
-                headers=PAGE_SECURITY_HEADERS,
+                headers=PAGE_HEADERS,
             )
         return HTMLResponse(
             content=index_file.read_text(encoding="utf-8"),
