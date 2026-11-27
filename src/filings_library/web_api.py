@@ -415,12 +415,16 @@ def build_xbrl_statements(
                             preferred_unit = unit_name
                         prev = best_by_period.get(period_label)
                         prev_filed = str(prev.get("filed") or "") if prev else ""
+                        prev_end = str(prev.get("end") or "") if prev else ""
                         prev_rank = int(prev.get("_rank", 999)) if prev else 999
-                        # Prefer latest filing date; break same-filing ties by concept priority.
+                        # Prefer latest filing date; break ties by latest end date, then concept priority.
                         if (
                             prev is None
                             or filed > prev_filed
-                            or (filed == prev_filed and concept_rank < prev_rank)
+                            or (filed == prev_filed and end > prev_end)
+                            or (
+                                filed == prev_filed and end == prev_end and concept_rank < prev_rank
+                            )
                         ):
                             accn = str(entry.get("accn") or "")
                             best_by_period[period_label] = {

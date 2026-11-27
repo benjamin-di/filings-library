@@ -61,17 +61,27 @@ async function apiGet(path) {
   return res.json();
 }
 
+function currencyPrefix(ccy) {
+  if (ccy === "USD") return "$";
+  if (ccy === "EUR") return "€";
+  if (ccy === "GBP") return "£";
+  if (ccy === "JPY" || ccy === "CNY") return "¥";
+  if (ccy === "HKD") return "HK$";
+  return ccy ? `${ccy} ` : "";
+}
+
 function formatNumber(val, unit = "") {
   if (typeof val !== "number" || Number.isNaN(val)) return "—";
-  if (unit.includes("shares") && !unit.includes("USD")) {
+  const sign = val < 0 ? "-" : "";
+  const abs = Math.abs(val);
+  if (unit.includes("/shares")) {
+    const ccy = unit.split("/")[0].trim();
+    return `${sign}${currencyPrefix(ccy)}${abs.toFixed(2)}`;
+  }
+  if (unit === "shares") {
     return val.toLocaleString("en-US", { maximumFractionDigits: 0 });
   }
-  if (unit.includes("/shares")) {
-    return `$${val.toFixed(2)}`;
-  }
-  const abs = Math.abs(val);
-  const sign = val < 0 ? "-" : "";
-  const prefix = unit === "USD" ? "$" : unit === "EUR" ? "€" : "";
+  const prefix = currencyPrefix(unit.trim());
   if (abs >= 1e9) return `${sign}${prefix}${(abs / 1e9).toFixed(2)}B`;
   if (abs >= 1e6) return `${sign}${prefix}${(abs / 1e6).toFixed(1)}M`;
   if (abs >= 1e3) return `${sign}${prefix}${(abs / 1e3).toFixed(1)}K`;
@@ -443,7 +453,8 @@ async function openDocument(documentId, { locator = "", query = "", replaceUrl =
   if (reqId !== state.openDocSeq) return;
   state.docDetail = detail;
   state.selectedCompany = detail.document.source_key;
-  state.diffTargetId = detail.document.prev_document_id || null;
+  state.diffTargetId =
+    detail.document.prev_document_id || detail.document.peer_documents?.[0]?.document_id || null;
 
   let chosenLoc = locator;
   if (!chosenLoc && detail.outline.length) {
@@ -673,6 +684,7 @@ function renderRedlineDrawer(doc) {
   }
   const controls = `
     <select id="diff-peer-select" class="select-input" aria-label="Compare against prior filing">
+      ${!state.diffTargetId ? '<option value="" selected>Select filing to compare…</option>' : ""}
       ${peers
         .map(
           (p) =>

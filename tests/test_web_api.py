@@ -445,3 +445,36 @@ def test_xbrl_comparative_years_q4_filter_asc606_and_xlsx_filename() -> None:
         source_bytes=100,
     )
     assert _sanitize_download_filename(doc_xlsx).endswith(".xlsx")
+
+    # 4. Balance-sheet instant facts from the same 10-K prefer the latest end date (year-end over Q1).
+    facts_bs = {
+        "facts": {
+            "us-gaap": {
+                "CashAndCashEquivalentsAtCarryingValue": {
+                    "units": {
+                        "USD": [
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "end": "2025-03-31",
+                                "filed": "2026-02-20",
+                                "val": 12_000_000_000,
+                                "accn": "a-2025",
+                            },
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "end": "2025-12-31",
+                                "filed": "2026-02-20",
+                                "val": 45_000_000_000,
+                                "accn": "a-2025",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    stmts_bs = build_xbrl_statements(facts_bs, doc_id_by_accn={})
+    assert stmts_bs["rows"][0]["values"]["FY2025"]["end"] == "2025-12-31"
+    assert stmts_bs["rows"][0]["values"]["FY2025"]["val"] == 45_000_000_000
