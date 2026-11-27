@@ -7,11 +7,13 @@ Zero write/upload endpoints; raw HTML responses are strictly sandboxed via CSP.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import html
 import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -339,13 +341,29 @@ def compute_section_diff(
     }
 
 
+def _is_annual_flow_entry(entry: dict[str, Any], end: str) -> bool:
+    """Return True if an income/cashflow entry represents a full-year (~330-380 day) period."""
+    start = str(entry.get("start") or "").strip()
+    if start:
+        try:
+            days = (date.fromisoformat(end[:10]) - date.fromisoformat(start[:10])).days
+        except ValueError:
+            return False
+        return 330 <= days <= 380
+    frame = str(entry.get("frame") or "").upper()
+    if "Q" in frame:
+        return False
+    fp = str(entry.get("fp") or "").upper()
+    return fp in {"", "FY"}
+
+
 def build_xbrl_statements(
     facts_json: dict[str, Any],
     *,
     doc_id_by_accn: dict[str, str],
     max_periods: int = 6,
 ) -> dict[str, Any]:
-    """Map raw SEC `companyfacts` JSON into standardized annual/quarterly statement rows."""
+    """Map raw SEC `companyfacts` JSON into standardized annual statement rows."""
     facts_root = facts_json.get("facts")
     if not isinstance(facts_root, dict):
         return {"periods": [], "rows": []}
@@ -356,14 +374,14 @@ def build_xbrl_statements(
 
     for key, label, statement, concepts in STANDARD_XBRL_METRICS:
         best_by_period: dict[str, dict[str, Any]] = {}
-        matched_concept: str | None = None
-        matched_unit: str | None = None
+        is_flow = statement in ("income", "cashflow")
+        preferred_unit: str | None = None
 
         for taxonomy in ("us-gaap", "ifrs-full"):
             tax_block = facts_root.get(taxonomy)
             if not isinstance(tax_block, dict):
                 continue
-            for concept in concepts:
+            for concept_rank, concept in enumerate(concepts):
                 cblock = tax_block.get(concept)
                 if not isinstance(cblock, dict):
                     continue
@@ -373,22 +391,37 @@ def build_xbrl_statements(
                 for unit_name, entries in units.items():
                     if not isinstance(entries, list):
                         continue
+                    if preferred_unit is not None and unit_name != preferred_unit:
+                        continue
                     for entry in entries:
                         if not isinstance(entry, dict):
                             continue
                         form = str(entry.get("form") or "")
                         if form not in annual_forms:
                             continue
-                        end = str(entry.get("end") or "")
-                        filed = str(entry.get("filed") or "")
+                        end = str(entry.get("end") or "").strip()
+                        filed = str(entry.get("filed") or "").strip()
                         val = entry.get("val")
-                        if not end or not isinstance(val, (int, float)):
+                        if (
+                            len(end) < 4
+                            or not end[:4].isdigit()
+                            or not isinstance(val, (int, float))
+                        ):
                             continue
-                        fy = entry.get("fy")
-                        period_label = f"FY{fy}" if fy else end[:4]
-                        # Prefer latest filing date for a given fiscal period.
+                        if is_flow and not _is_annual_flow_entry(entry, end):
+                            continue
+                        period_label = f"FY{end[:4]}"
+                        if preferred_unit is None:
+                            preferred_unit = unit_name
                         prev = best_by_period.get(period_label)
-                        if prev is None or filed >= str(prev.get("filed") or ""):
+                        prev_filed = str(prev.get("filed") or "") if prev else ""
+                        prev_rank = int(prev.get("_rank", 999)) if prev else 999
+                        # Prefer latest filing date; break same-filing ties by concept priority.
+                        if (
+                            prev is None
+                            or filed > prev_filed
+                            or (filed == prev_filed and concept_rank < prev_rank)
+                        ):
                             accn = str(entry.get("accn") or "")
                             best_by_period[period_label] = {
                                 "val": val,
@@ -399,24 +432,25 @@ def build_xbrl_statements(
                                 "accn": accn,
                                 "document_id": doc_id_by_accn.get(accn),
                                 "concept": f"{taxonomy}:{concept}",
+                                "_rank": concept_rank,
                             }
-                            matched_concept = f"{taxonomy}:{concept}"
-                            matched_unit = unit_name
-                if best_by_period:
-                    break
-            if best_by_period:
-                break
 
         if best_by_period:
             all_periods.update(best_by_period.keys())
+            latest_period = max(best_by_period.keys())
+            latest_cell = best_by_period[latest_period]
+            cleaned_values = {
+                p: {k: v for k, v in cell.items() if k != "_rank"}
+                for p, cell in best_by_period.items()
+            }
             rows.append(
                 {
                     "key": key,
                     "label": label,
                     "statement": statement,
-                    "concept": matched_concept,
-                    "unit": matched_unit,
-                    "values": best_by_period,
+                    "concept": latest_cell["concept"],
+                    "unit": latest_cell["unit"],
+                    "values": cleaned_values,
                 }
             )
 
@@ -444,7 +478,15 @@ def _find_previous_document_id(
 
 
 def _sanitize_download_filename(doc: DocumentRecord) -> str:
-    ext = ".pdf" if "pdf" in (doc.source_mime or "").lower() else ".html"
+    mime = (doc.source_mime or "").lower()
+    if "pdf" in mime:
+        ext = ".pdf"
+    elif "spreadsheetml" in mime or "excel" in mime:
+        ext = ".xlsx"
+    elif "html" in mime or "xhtml" in mime:
+        ext = ".html"
+    else:
+        ext = ".bin"
     safe_base = re.sub(
         r"[^A-Za-z0-9._-]+", "_", f"{doc.source_key}_{doc.filing_date}_{doc.document_id}"
     )
@@ -929,13 +971,19 @@ def build_web_routes(
             ".json": "application/json; charset=utf-8",
             ".woff2": "font/woff2",
         }
+        raw_bytes = candidate.read_bytes()
+        etag = f'"{hashlib.sha256(raw_bytes).hexdigest()[:16]}"'
+        asset_headers = {
+            "Cache-Control": "no-cache",
+            "ETag": etag,
+            "X-Content-Type-Options": "nosniff",
+        }
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers=asset_headers)
         return Response(
-            content=candidate.read_bytes(),
+            content=raw_bytes,
             media_type=media_types.get(suffix, "application/octet-stream"),
-            headers={
-                "Cache-Control": "public, max-age=31536000, immutable",
-                "X-Content-Type-Options": "nosniff",
-            },
+            headers=asset_headers,
         )
 
     routes: list[BaseRoute] = [

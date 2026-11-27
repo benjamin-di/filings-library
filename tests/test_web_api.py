@@ -237,20 +237,29 @@ def test_web_api_scope_isolation_and_strict_raw_sandboxing(tmp_path: Path) -> No
     assert diff_json["added_words"] > 0
     assert diff_json["removed_words"] > 0
 
-    # Standardized XBRL statement links back to doc_2026
+    # Standardized XBRL statement links back to doc_2026 (period derived from end date 2025-12-31)
     facts = client.get("/api/companies/alpha/facts", headers=alice)
     assert facts.status_code == 200
     fdata = facts.json()
     assert fdata["has_facts"] is True
-    assert fdata["periods"] == ["FY2026"]
-    assert fdata["rows"][0]["values"]["FY2026"]["document_id"] == doc_2026
+    assert fdata["periods"] == ["FY2025"]
+    assert fdata["rows"][0]["values"]["FY2025"]["document_id"] == doc_2026
 
-    # Static SPA & assets serve with security headers
+    # Static SPA & assets serve with security headers and ETag/no-cache (never immutable unhashed)
     spa = client.get(f"/d/{doc_2026}?loc=item:7", headers=alice)
     assert spa.status_code == 200
     assert "Filings Library" in spa.text
     assert spa.headers["x-frame-options"] == "DENY"
-    assert client.get("/assets/app.js").status_code == 200
+    asset_resp = client.get("/assets/app.js")
+    assert asset_resp.status_code == 200
+    assert asset_resp.headers["cache-control"] == "no-cache"
+    assert "etag" in asset_resp.headers
+    assert (
+        client.get(
+            "/assets/app.js", headers={"If-None-Match": asset_resp.headers["etag"]}
+        ).status_code
+        == 304
+    )
     assert client.get("/assets/../../pyproject.toml").status_code == 404
 
     # Strictly read-only: no POST upload route exists
@@ -309,3 +318,130 @@ def test_helpers_hkex_cleanup_esef_chunking_diff_and_viewer_url() -> None:
     )
     assert stmts["periods"] == ["FY2025"]
     assert stmts["rows"][0]["values"]["FY2025"]["document_id"] == "doc-esef-1"
+
+
+def test_xbrl_comparative_years_q4_filter_asc606_and_xlsx_filename() -> None:
+    from filings_library.web_api import _sanitize_download_filename
+
+    # 1. Single FY2025 10-K with 3 comparative years + 3-month Q4 entry all sharing fy=2025.
+    facts_comparative = {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "fp": "FY",
+                                "start": "2023-01-01",
+                                "end": "2023-12-31",
+                                "filed": "2026-02-20",
+                                "val": 100_000_000_000,
+                                "accn": "a-2025",
+                            },
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "fp": "FY",
+                                "start": "2024-01-01",
+                                "end": "2024-12-31",
+                                "filed": "2026-02-20",
+                                "val": 120_000_000_000,
+                                "accn": "a-2025",
+                            },
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "fp": "FY",
+                                "start": "2025-01-01",
+                                "end": "2025-12-31",
+                                "filed": "2026-02-20",
+                                "val": 150_000_000_000,
+                                "accn": "a-2025",
+                            },
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "fp": "FY",
+                                "start": "2025-10-01",
+                                "end": "2025-12-31",
+                                "filed": "2026-02-20",
+                                "val": 40_000_000_000,
+                                "accn": "a-2025",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    stmts = build_xbrl_statements(facts_comparative, doc_id_by_accn={"a-2025": "doc-2025"})
+    assert stmts["periods"] == ["FY2025", "FY2024", "FY2023"]
+    vals = stmts["rows"][0]["values"]
+    assert vals["FY2025"]["val"] == 150_000_000_000
+    assert vals["FY2024"]["val"] == 120_000_000_000
+    assert vals["FY2023"]["val"] == 100_000_000_000
+
+    # 2. ASC 606 concept switch merges legacy Revenues with newer contract revenue concept.
+    facts_switch = {
+        "facts": {
+            "us-gaap": {
+                "Revenues": {
+                    "units": {
+                        "USD": [
+                            {
+                                "form": "10-K",
+                                "fy": 2017,
+                                "fp": "FY",
+                                "start": "2017-01-01",
+                                "end": "2017-12-31",
+                                "filed": "2018-02-20",
+                                "val": 10_000_000_000,
+                                "accn": "a-2017",
+                            }
+                        ]
+                    }
+                },
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "units": {
+                        "USD": [
+                            {
+                                "form": "10-K",
+                                "fy": 2025,
+                                "fp": "FY",
+                                "start": "2025-01-01",
+                                "end": "2025-12-31",
+                                "filed": "2026-02-20",
+                                "val": 150_000_000_000,
+                                "accn": "a-2025",
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+    }
+    stmts_sw = build_xbrl_statements(facts_switch, doc_id_by_accn={})
+    assert stmts_sw["periods"] == ["FY2025", "FY2017"]
+    assert stmts_sw["rows"][0]["concept"] == (
+        "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+    )
+    assert stmts_sw["rows"][0]["values"]["FY2025"]["val"] == 150_000_000_000
+
+    # 3. Download filename preserves .xlsx extension for spreadsheets.
+    doc_xlsx = DocumentRecord(
+        document_id="doc-xlsx-1",
+        source_key="co1",
+        adapter=SourceAdapter.EARNINGS_WATCH,
+        external_id="e1",
+        form_type="databook",
+        form_family=FormFamily.DATABOOK,
+        title="Databook",
+        filing_date="2026-11-01",
+        source_url="https://ir.example.test/d.xlsx",
+        source_sha256="0" * 64,
+        source_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        source_bytes=100,
+    )
+    assert _sanitize_download_filename(doc_xlsx).endswith(".xlsx")

@@ -25,6 +25,10 @@ const state = {
   cmdItems: [],
   cmdSelected: 0,
   cmdTimer: null,
+  // Async request sequence guards
+  cmdSearchSeq: 0,
+  companySeq: 0,
+  openDocSeq: 0,
 };
 
 function esc(str) {
@@ -74,13 +78,37 @@ function formatNumber(val, unit = "") {
   return `${sign}${prefix}${abs.toFixed(2)}`;
 }
 
-// Highlight meaningful query terms in already-escaped HTML text segments.
-function highlightEscaped(escapedText, query) {
-  if (!query) return escapedText;
+// Highlight meaningful query terms in raw (unescaped) text, then HTML-escape safely.
+function highlightRaw(rawText, query) {
+  const text = String(rawText ?? "");
+  if (!query) return esc(text);
   const terms = [...new Set((query.match(/[A-Za-z0-9][A-Za-z0-9._-]{1,}/g) || []).map((t) => t.toLowerCase()))];
-  if (!terms.length) return escapedText;
+  if (!terms.length) return esc(text);
   const pattern = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi");
-  return escapedText.replace(pattern, '<mark class="hit">$1</mark>');
+  const parts = text.split(pattern);
+  return parts
+    .map((part, idx) => (idx % 2 === 1 ? `<mark class="hit">${esc(part)}</mark>` : esc(part)))
+    .join("");
+}
+
+function splitMarkdownRow(rowLine) {
+  const trimmed = rowLine.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "");
+  const cells = [];
+  let cur = "";
+  for (let idx = 0; idx < trimmed.length; idx += 1) {
+    const ch = trimmed[idx];
+    if (ch === "\\" && idx + 1 < trimmed.length && trimmed[idx + 1] === "|") {
+      cur += "|";
+      idx += 1;
+    } else if (ch === "|") {
+      cells.push(cur.trim());
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  cells.push(cur.trim());
+  return cells;
 }
 
 // Safe Markdown -> HTML renderer with copyable financial table cards.
@@ -91,10 +119,18 @@ function renderMarkdown(md, query) {
   let tableIdx = 0;
 
   const inline = (text) => {
-    let s = esc(text);
-    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    s = s.replace(/`([^`]+)`/g, '<code class="mono">$1</code>');
-    return highlightEscaped(s, query);
+    const tokens = String(text ?? "").split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+    return tokens
+      .map((tok) => {
+        if (tok.startsWith("**") && tok.endsWith("**") && tok.length > 4) {
+          return `<strong>${highlightRaw(tok.slice(2, -2), query)}</strong>`;
+        }
+        if (tok.startsWith("`") && tok.endsWith("`") && tok.length > 2) {
+          return `<code class="mono">${highlightRaw(tok.slice(1, -1), query)}</code>`;
+        }
+        return highlightRaw(tok, query);
+      })
+      .join("");
   };
 
   while (i < lines.length) {
@@ -105,18 +141,11 @@ function renderMarkdown(md, query) {
     }
     // Markdown table block
     if (line.includes("|") && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
-      const parseRow = (r) =>
-        r
-          .trim()
-          .replace(/^\|/, "")
-          .replace(/\|$/, "")
-          .split("|")
-          .map((c) => c.trim());
-      const headers = parseRow(line);
+      const headers = splitMarkdownRow(line);
       i += 2;
       const rows = [];
       while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
-        rows.push(parseRow(lines[i]));
+        rows.push(splitMarkdownRow(lines[i]));
         i += 1;
       }
       const tid = `fin-table-${tableIdx++}`;
@@ -222,14 +251,43 @@ function syncNavTabs() {
 }
 
 /* ==================== COMPANIES MATRIX VIEW ==================== */
-async function selectCompany(sourceKey) {
+async function selectCompany(sourceKey, { replaceUrl = true } = {}) {
+  const reqId = ++state.companySeq;
   state.selectedCompany = sourceKey;
-  updateUrl(true);
+  updateUrl(replaceUrl);
   const qs = new URLSearchParams({ source_key: sourceKey, limit: "200" });
   if (state.familyFilter) qs.set("form_family", state.familyFilter);
   const data = await apiGet(`/api/documents?${qs}`);
+  if (reqId !== state.companySeq) return;
   state.companyDocs = data.documents || [];
   renderCompaniesView();
+}
+
+function renderCompanyListItems(filterVal) {
+  const filtered = state.companies.filter(
+    (c) =>
+      !filterVal ||
+      c.name.toLowerCase().includes(filterVal) ||
+      c.ticker.toLowerCase().includes(filterVal) ||
+      c.source_key.toLowerCase().includes(filterVal)
+  );
+  const activeComp = state.companies.find((c) => c.source_key === state.selectedCompany) || filtered[0];
+  return filtered
+    .map(
+      (c) => `
+    <div class="company-row ${activeComp && c.source_key === activeComp.source_key ? "active" : ""}" data-select-company="${esc(c.source_key)}">
+      <div>
+        <div class="company-row-title">${esc(c.ticker || c.source_key)}</div>
+        <div class="company-row-sub">${esc(c.name)}</div>
+      </div>
+      <div class="company-row-right">
+        <span class="badge ${c.document_count > 0 ? "badge-blue" : "badge-muted"}">${c.document_count}</span>
+        ${c.has_company_facts ? '<span class="badge badge-green">XBRL</span>' : ""}
+      </div>
+    </div>
+  `
+    )
+    .join("");
 }
 
 function renderCompaniesView() {
@@ -342,12 +400,19 @@ function renderCompaniesView() {
   `;
 
   const inp = document.getElementById("company-filter-input");
-  if (inp) {
-    inp.addEventListener("input", () => renderCompaniesView());
+  const listEl = main.querySelector(".company-list");
+  const bindCompanyRowClicks = () => {
+    main.querySelectorAll("[data-select-company]").forEach((el) => {
+      el.addEventListener("click", () => selectCompany(el.dataset.selectCompany));
+    });
+  };
+  if (inp && listEl) {
+    inp.addEventListener("input", () => {
+      listEl.innerHTML = renderCompanyListItems(inp.value.toLowerCase());
+      bindCompanyRowClicks();
+    });
   }
-  main.querySelectorAll("[data-select-company]").forEach((el) => {
-    el.addEventListener("click", () => selectCompany(el.dataset.selectCompany));
-  });
+  bindCompanyRowClicks();
   main.querySelectorAll("[data-family]").forEach((el) => {
     el.addEventListener("click", () => {
       state.familyFilter = el.dataset.family;
@@ -364,7 +429,8 @@ function renderCompaniesView() {
 }
 
 /* ==================== 3-PANE READER VIEW ==================== */
-async function openDocument(documentId, { locator = "", query = "" } = {}) {
+async function openDocument(documentId, { locator = "", query = "", replaceUrl = false } = {}) {
+  const reqId = ++state.openDocSeq;
   state.view = "reader";
   state.docId = documentId;
   state.activeQuery = query || "";
@@ -374,6 +440,7 @@ async function openDocument(documentId, { locator = "", query = "" } = {}) {
 
   const qs = query ? `?q=${encodeURIComponent(query)}` : "";
   const detail = await apiGet(`/api/documents/${encodeURIComponent(documentId)}${qs}`);
+  if (reqId !== state.openDocSeq) return;
   state.docDetail = detail;
   state.selectedCompany = detail.document.source_key;
   state.diffTargetId = detail.document.prev_document_id || null;
@@ -384,11 +451,13 @@ async function openDocument(documentId, { locator = "", query = "" } = {}) {
     chosenLoc = (withHit || detail.outline[0]).locator;
   }
   state.activeLocator = chosenLoc;
-  updateUrl(false);
+  updateUrl(replaceUrl);
 
   await Promise.all([loadActiveSection(), loadCompanyFacts(detail.document.source_key)]);
+  if (reqId !== state.openDocSeq) return;
   if (state.drawerTab === "redline" && state.diffTargetId) {
     await loadDiff();
+    if (reqId !== state.openDocSeq) return;
   }
   renderReaderView();
 }
@@ -799,6 +868,7 @@ function closeCmdPalette() {
 }
 
 async function runCmdSearch() {
+  const reqId = ++state.cmdSearchSeq;
   const q = document.getElementById("cmd-input").value.trim();
   const compFilter = document.getElementById("cmd-company-filter").value;
   const famFilter = document.getElementById("cmd-family-filter").value;
@@ -822,6 +892,7 @@ async function runCmdSearch() {
   if (famFilter) qs.set("form_family", famFilter);
   try {
     const data = await apiGet(`/api/search?${qs}`);
+    if (reqId !== state.cmdSearchSeq) return;
     const compMatches = state.companies
       .filter(
         (c) =>
@@ -877,7 +948,7 @@ function renderCmdResults() {
             <span class="badge badge-blue">${esc(item.form)}</span>
             <span class="mono" style="font-size:11px;color:var(--text-muted)">${esc(item.date)} · ${esc(item.locator)}</span>
           </div>
-          <div class="cmd-item-snippet">${highlightEscaped(esc(item.snippet), item.query)}</div>
+          <div class="cmd-item-snippet">${highlightRaw(item.snippet, item.query)}</div>
         </div>
       `;
     })
@@ -901,6 +972,26 @@ async function activateCmdItem(idx) {
 }
 
 /* ==================== BOOTSTRAP ==================== */
+async function routeFromLocation({ replaceUrl = true } = {}) {
+  const pathMatch = /^\/d\/([^/]+)$/.exec(window.location.pathname);
+  const params = new URLSearchParams(window.location.search);
+  if (pathMatch) {
+    await openDocument(decodeURIComponent(pathMatch[1]), {
+      locator: params.get("loc") || "",
+      query: params.get("q") || "",
+      replaceUrl,
+    });
+  } else if (params.get("view") === "xbrl") {
+    state.selectedCompany = params.get("company") || null;
+    await loadXbrlView();
+  } else {
+    state.view = "companies";
+    const initialComp = params.get("company") || state.companies[0]?.source_key;
+    if (initialComp) await selectCompany(initialComp, { replaceUrl });
+    else renderCompaniesView();
+  }
+}
+
 async function init() {
   try {
     const [me, compData] = await Promise.all([apiGet("/api/me"), apiGet("/api/companies")]);
@@ -921,26 +1012,15 @@ async function init() {
       compSel.appendChild(opt);
     });
 
-    // Route from URL
-    const pathMatch = /^\/d\/([^/]+)$/.exec(window.location.pathname);
-    const params = new URLSearchParams(window.location.search);
-    if (pathMatch) {
-      await openDocument(decodeURIComponent(pathMatch[1]), {
-        locator: params.get("loc") || "",
-        query: params.get("q") || "",
-      });
-    } else if (params.get("view") === "xbrl") {
-      state.selectedCompany = params.get("company") || null;
-      await loadXbrlView();
-    } else {
-      const initialComp = params.get("company") || state.companies[0]?.source_key;
-      if (initialComp) await selectCompany(initialComp);
-      else renderCompaniesView();
-    }
+    await routeFromLocation({ replaceUrl: true });
   } catch (err) {
     document.getElementById("main-content").innerHTML = `<div class="empty-state">Failed to load workspace: ${esc(err.message)}</div>`;
   }
 }
+
+window.addEventListener("popstate", () => {
+  routeFromLocation({ replaceUrl: true }).catch(() => {});
+});
 
 // Global listeners
 document.getElementById("cmd-trigger").addEventListener("click", openCmdPalette);
