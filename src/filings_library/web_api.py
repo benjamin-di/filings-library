@@ -1021,6 +1021,26 @@ def build_web_routes(
             headers=asset_headers,
         )
 
+    async def _connections_home(request: Request) -> Response:
+        who = _resolve_identity(request)
+        if not who or not who.get("sub"):
+            if browser_auth is not None:
+                return RedirectResponse(
+                    "/connections/login",
+                    status_code=303,
+                    headers={"Cache-Control": "no-store"},
+                )
+            return JSONResponse(
+                {"error": "unauthorized", "detail": "Web UI authentication is not configured"},
+                status_code=401,
+                headers=API_SECURITY_HEADERS,
+            )
+        return RedirectResponse(
+            "/",
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
+
     routes: list[BaseRoute] = [
         Route("/api/me", _api_me, methods=["GET"]),
         Route("/api/companies", _api_companies, methods=["GET"]),
@@ -1033,6 +1053,7 @@ def build_web_routes(
         Route("/api/search", _api_search, methods=["GET"]),
         Route("/assets/{asset_path:path}", _serve_asset, methods=["GET"]),
         Route("/d/{document_id}", _serve_spa, methods=["GET"]),
+        Route("/connections/", _connections_home, methods=["GET"]),
         Route("/", _serve_spa, methods=["GET"]),
     ]
     if browser_auth is not None:

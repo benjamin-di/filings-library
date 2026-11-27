@@ -648,3 +648,56 @@ def test_suite_switcher_payload_and_auxiliary_pages(
         fallback_no_suite = client_no_suite.get("/")
         assert fallback_no_suite.status_code == 503
         assert '<details class="suite-switch">' not in fallback_no_suite.text
+
+
+def test_connections_home_redirects_after_oidc_callback(tmp_path: Path) -> None:
+    import time
+
+    from signin_window.oidc import BrowserAuth, OIDCConfig
+
+    svc, *_ = _seed_service(tmp_path)
+    state_dir = tmp_path / "browser"
+    auth = BrowserAuth(
+        OIDCConfig(
+            issuer="https://idp.example.com",
+            client_id="filings-web",
+            public_url="https://filings.example.com",
+            state_dir=state_dir,
+            required_group="filings",
+            cookie_name="__Host-filings",
+            allow_loopback_http=True,
+        )
+    )
+    app = create_http_app(
+        svc,
+        backend_bearer_token=BEARER,
+        allowed_hosts=["testserver", "localhost"],
+        browser_auth=auth,
+        public_base_url="https://filings.example.com",
+    )
+    client = TestClient(app)
+
+    # Unauthenticated /connections/ redirects to /connections/login with no-store
+    unauth = client.get("/connections/", follow_redirects=False)
+    assert unauth.status_code == 303
+    assert unauth.headers["location"] == "/connections/login"
+    assert unauth.headers["cache-control"] == "no-store"
+
+    # Authenticated /connections/ (post-OIDC callback landing) redirects to /
+    sid = "B" * 43
+    auth.store.save(
+        sid,
+        {
+            "issuer": "https://idp.example.com",
+            "sub": "user-a",
+            "groups": ["filings"],
+            "name": "Alex Example",
+            "claims": {},
+            "expires": time.time() + 3600,
+        },
+    )
+    client.cookies.set(auth.cookie, sid)
+    authed = client.get("/connections/", follow_redirects=False)
+    assert authed.status_code == 303
+    assert authed.headers["location"] == "/"
+    assert authed.headers["cache-control"] == "no-store"
