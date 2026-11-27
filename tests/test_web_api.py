@@ -539,6 +539,7 @@ def test_suite_switcher_payload_and_auxiliary_pages(
             allow_loopback_http=True,
         ),
         suite=directory,
+        home="/",
     )
     sid = "A" * 43
     auth.store.save(
@@ -650,7 +651,9 @@ def test_suite_switcher_payload_and_auxiliary_pages(
         assert '<details class="suite-switch">' not in fallback_no_suite.text
 
 
-def test_connections_home_redirects_after_oidc_callback(tmp_path: Path) -> None:
+def test_connections_home_redirects_and_oidc_callback_lands_on_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import time
 
     from signin_window.oidc import BrowserAuth, OIDCConfig
@@ -666,8 +669,11 @@ def test_connections_home_redirects_after_oidc_callback(tmp_path: Path) -> None:
             required_group="filings",
             cookie_name="__Host-filings",
             allow_loopback_http=True,
-        )
+        ),
+        home="/",
     )
+    assert auth.home == "/"
+
     app = create_http_app(
         svc,
         backend_bearer_token=BEARER,
@@ -677,27 +683,86 @@ def test_connections_home_redirects_after_oidc_callback(tmp_path: Path) -> None:
     )
     client = TestClient(app)
 
-    # Unauthenticated /connections/ redirects to /connections/login with no-store
-    unauth = client.get("/connections/", follow_redirects=False)
-    assert unauth.status_code == 303
-    assert unauth.headers["location"] == "/connections/login"
-    assert unauth.headers["cache-control"] == "no-store"
+    # Unauthenticated /connections and /connections/ redirect to /connections/login with no-store
+    for legacy_path in ("/connections", "/connections/"):
+        unauth = client.get(legacy_path, follow_redirects=False)
+        assert unauth.status_code == 303
+        assert unauth.headers["location"] == "/connections/login"
+        assert unauth.headers["cache-control"] == "no-store"
 
-    # Authenticated /connections/ (post-OIDC callback landing) redirects to /
-    sid = "B" * 43
+    # OIDC callback redirects directly to canonical / home (no extra /connections/ hop)
+    pending_sid = "P" * 43
     auth.store.save(
-        sid,
+        pending_sid,
         {
-            "issuer": "https://idp.example.com",
-            "sub": "user-a",
-            "groups": ["filings"],
-            "name": "Alex Example",
-            "claims": {},
-            "expires": time.time() + 3600,
+            "pending_expires": time.time() + 300,
         },
     )
-    client.cookies.set(auth.cookie, sid)
-    authed = client.get("/connections/", follow_redirects=False)
-    assert authed.status_code == 303
-    assert authed.headers["location"] == "/"
-    assert authed.headers["cache-control"] == "no-store"
+
+    async def _fake_authorize_access_token(request: object, **kwargs: object) -> dict[str, object]:
+        return {
+            "id_token": "stub-id-token",
+            "userinfo": {
+                "iss": "https://idp.example.com",
+                "sub": "user-a",
+                "groups": ["filings"],
+                "name": "Alex Example",
+                "exp": time.time() + 3600,
+            },
+        }
+
+    monkeypatch.setattr(auth.client, "authorize_access_token", _fake_authorize_access_token)
+    client.cookies.set(auth.cookie, pending_sid)
+    callback_resp = client.get("/connections/callback?code=abc&state=xyz", follow_redirects=False)
+    assert callback_resp.status_code == 303
+    assert callback_resp.headers["location"] == "/"
+
+    # Resulting session can load canonical / home directly
+    home_resp = client.get("/", follow_redirects=False)
+    assert home_resp.status_code == 200
+
+    # Authenticated /connections and /connections/ permanently redirect (308) to /
+    for legacy_path in ("/connections", "/connections/"):
+        authed = client.get(legacy_path, follow_redirects=False)
+        assert authed.status_code == 308
+        assert authed.headers["location"] == "/"
+        assert authed.headers["cache-control"] == "no-store"
+
+
+def test_cli_serve_configures_browser_auth_root_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import uvicorn
+
+    from filings_library import cli
+
+    captured: dict[str, object] = {}
+
+    orig_create = cli.create_http_app
+
+    def _capture_create_http_app(*args: object, **kwargs: object) -> object:
+        captured["browser_auth"] = kwargs.get("browser_auth")
+        return orig_create(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "create_http_app", _capture_create_http_app)
+    monkeypatch.setattr(uvicorn, "run", lambda app, host, port: None)
+
+    rc = cli.main(
+        [
+            "serve",
+            "--data-dir",
+            str(tmp_path),
+            "--targets-url",
+            "http://127.0.0.1:9999",
+            "--bearer-token",
+            BEARER,
+            "--public-url",
+            "https://filings.example.com",
+            "--oidc-issuer",
+            "https://idp.example.com",
+        ]
+    )
+    assert rc == 0
+    browser_auth = captured["browser_auth"]
+    assert browser_auth is not None
+    assert getattr(browser_auth, "home") == "/"

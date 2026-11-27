@@ -1037,7 +1037,7 @@ def build_web_routes(
             )
         return RedirectResponse(
             "/",
-            status_code=303,
+            status_code=308,
             headers={"Cache-Control": "no-store"},
         )
 
@@ -1053,6 +1053,7 @@ def build_web_routes(
         Route("/api/search", _api_search, methods=["GET"]),
         Route("/assets/{asset_path:path}", _serve_asset, methods=["GET"]),
         Route("/d/{document_id}", _serve_spa, methods=["GET"]),
+        Route("/connections", _connections_home, methods=["GET"]),
         Route("/connections/", _connections_home, methods=["GET"]),
         Route("/", _serve_spa, methods=["GET"]),
     ]

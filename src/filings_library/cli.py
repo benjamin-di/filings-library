@@ -553,7 +553,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                     required_group=str(args.oidc_required_group or "").strip(),
                     cookie_name="__Host-filings",
                     claim_names=("person_id",),
-                )
+                ),
+                home="/",
             )
         app = create_http_app(
             svc,
