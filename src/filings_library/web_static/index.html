@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Filings Library</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <a href="/" class="brand" id="brand-home">
+          <span class="brand-dot"></span>
+          <span>Filings Library</span>
+        </a>
+        <nav class="nav-tabs" aria-label="Primary views">
+          <button type="button" class="nav-tab" data-view="companies">Companies</button>
+          <button type="button" class="nav-tab" data-view="reader">Reader</button>
+          <button type="button" class="nav-tab" data-view="xbrl">XBRL Compare</button>
+        </nav>
+      </div>
+      <button type="button" class="cmd-trigger" id="cmd-trigger" aria-label="Search filings (Cmd+K)">
+        <span class="cmd-placeholder" id="cmd-trigger-label">Search filings, tickers, phrases…</span>
+        <kbd class="kbd">⌘K</kbd>
+      </button>
+      <div class="topbar-right">
+        <span class="badge badge-green" id="coverage-badge">…</span>
+        <span class="user-label" id="user-label"></span>
+        <form method="post" action="/connections/logout" id="logout-form" class="hidden">
+          <button type="submit" class="btn btn-ghost btn-xs">Sign out</button>
+        </form>
+      </div>
+    </header>
+
+    <main id="main-content" class="main-content">
+      <div class="loading-state">Loading filings workspace…</div>
+    </main>
+  </div>
+
+  <!-- Global Cmd+K Command Palette -->
+  <div id="cmd-backdrop" class="cmd-backdrop hidden" role="dialog" aria-modal="true" aria-label="Search filings">
+    <div class="cmd-modal">
+      <div class="cmd-input-row">
+        <input id="cmd-input" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search across all filings or jump to a company (e.g. NVDA, Blackwell margin)…" />
+        <kbd class="kbd">ESC</kbd>
+      </div>
+      <div class="cmd-filters">
+        <select id="cmd-company-filter" aria-label="Filter by company">
+          <option value="">All companies</option>
+        </select>
+        <select id="cmd-family-filter" aria-label="Filter by form family">
+          <option value="">All form types</option>
+          <option value="annual_report">Annual (10-K / 20-F / AR)</option>
+          <option value="quarterly_report">Quarterly (10-Q / 6-K)</option>
+          <option value="interim_report">Interim</option>
+          <option value="results_release">Results Releases</option>
+          <option value="current_report">Current (8-K / 6-K)</option>
+          <option value="proxy">Proxy (DEF 14A)</option>
+        </select>
+      </div>
+      <div id="cmd-results" class="cmd-results"></div>
+      <div class="cmd-footer">
+        <span><kbd class="kbd">↑</kbd> <kbd class="kbd">↓</kbd> navigate</span>
+        <span><kbd class="kbd">↵</kbd> open</span>
+        <span><kbd class="kbd">n</kbd> / <kbd class="kbd">p</kbd> next/prev hit in reader</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

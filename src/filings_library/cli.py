@@ -267,6 +267,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("FILINGS_ALLOWED_HOSTS", "localhost,127.0.0.1"),
         help="Comma-separated allowed Host header values (env: FILINGS_ALLOWED_HOSTS)",
     )
+    p_serve.add_argument(
+        "--public-url",
+        default=os.environ.get("FILINGS_PUBLIC_URL", ""),
+        help="Canonical public web URL for OIDC and MCP citation deep-links (env: FILINGS_PUBLIC_URL)",
+    )
+    p_serve.add_argument(
+        "--oidc-issuer",
+        default=os.environ.get("FILINGS_OIDC_ISSUER", ""),
+        help="OIDC issuer URL for browser workspace authentication (env: FILINGS_OIDC_ISSUER)",
+    )
+    p_serve.add_argument(
+        "--oidc-client-id",
+        default=os.environ.get("FILINGS_OIDC_CLIENT_ID", "filings-web"),
+        help="Public PKCE OIDC client ID (env: FILINGS_OIDC_CLIENT_ID)",
+    )
+    p_serve.add_argument(
+        "--oidc-required-group",
+        default=os.environ.get("FILINGS_OIDC_REQUIRED_GROUP", ""),
+        help="Required OIDC group claim for browser workspace access (env: FILINGS_OIDC_REQUIRED_GROUP)",
+    )
 
     # extractor
     p_ext = sub.add_parser("extractor", help="Run stateless filings-extractor HTTP service")
@@ -496,10 +516,29 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         resolver = TargetsScopeResolver(_build_targets_client(args))
         svc = FilingsService(store, cas, resolver)
         hosts = [h.strip() for h in str(args.allowed_hosts).split(",") if h.strip()]
+        public_url = str(args.public_url or "").strip().rstrip("/") or None
+        oidc_issuer = str(args.oidc_issuer or "").strip()
+        browser_auth = None
+        if oidc_issuer and public_url:
+            from signin_window.oidc import BrowserAuth, OIDCConfig
+
+            browser_auth = BrowserAuth(
+                OIDCConfig(
+                    issuer=oidc_issuer,
+                    client_id=str(args.oidc_client_id or "filings-web").strip(),
+                    public_url=public_url,
+                    state_dir=Path(args.data_dir) / "browser",
+                    required_group=str(args.oidc_required_group or "").strip(),
+                    cookie_name="__Host-filings",
+                    claim_names=("person_id",),
+                )
+            )
         app = create_http_app(
             svc,
             backend_bearer_token=args.bearer_token,
             allowed_hosts=hosts,
+            browser_auth=browser_auth,
+            public_base_url=public_url,
         )
         uvicorn.run(app, host=args.host, port=args.port)
         return 0

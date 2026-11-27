@@ -5,15 +5,17 @@ from __future__ import annotations
 import contextvars
 import hmac
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import Any, TypeVar
 
 from fastmcp import FastMCP
+from signin_window.oidc import BrowserAuth
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from filings_library.service import (
@@ -23,6 +25,7 @@ from filings_library.service import (
     clamp_max_chars,
 )
 from filings_library.targets_client import HubUnavailableError
+from filings_library.web_api import WebAuthResolver, build_viewer_url, build_web_routes
 
 MIN_BEARER_TOKEN_LENGTH = 32
 SUBJECT_HEADER = "x-fleet-subject"
@@ -55,7 +58,11 @@ async def _call_service(coro: Awaitable[T]) -> T:
         raise
 
 
-def create_mcp_server(service: FilingsService) -> FastMCP:
+def create_mcp_server(
+    service: FilingsService,
+    *,
+    public_base_url: str | None = None,
+) -> FastMCP:
     """Create the FastMCP server exposing the 6 scoped filings tools."""
     mcp = FastMCP("filings-library")
 
@@ -94,7 +101,7 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
     ) -> list[dict[str, Any]]:
         """Search filings across the caller's authorized companies and return citations."""
         person = _require_subject()
-        return await _call_service(
+        results = await _call_service(
             service.search(
                 person,
                 query,
@@ -104,6 +111,17 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
                 limit=clamp_limit(limit),
             )
         )
+        if public_base_url:
+            for item in results:
+                url = build_viewer_url(
+                    public_base_url,
+                    str(item["document_id"]),
+                    locator=str(item.get("locator") or "") or None,
+                    query=query,
+                )
+                if url:
+                    item["viewer_url"] = url
+        return results
 
     @mcp.tool()
     async def filings_read(
@@ -114,7 +132,7 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
     ) -> dict[str, Any]:
         """Read bounded sections of an authorized filing with strict citations."""
         person = _require_subject()
-        return await _call_service(
+        result = await _call_service(
             service.read(
                 person,
                 document_id,
@@ -123,6 +141,15 @@ def create_mcp_server(service: FilingsService) -> FastMCP:
                 max_chars=clamp_max_chars(max_chars),
             )
         )
+        if public_base_url and isinstance(result, dict):
+            url = build_viewer_url(
+                public_base_url,
+                document_id,
+                locator=start_locator,
+            )
+            if url:
+                result["viewer_url"] = url
+        return result
 
     @mcp.tool()
     async def filings_facts(
@@ -179,7 +206,7 @@ class _ScopedAuthMiddleware:
             return
 
         path = scope.get("path", "")
-        if path == "/health":
+        if path != "/mcp" and not path.startswith("/mcp/"):
             await self._app(scope, receive, send)
             return
 
@@ -289,14 +316,19 @@ def create_http_app(
     *,
     backend_bearer_token: str | None,
     allowed_hosts: Sequence[str] | None = None,
+    browser_auth: BrowserAuth | None = None,
+    web_auth_resolver: WebAuthResolver | None = None,
+    public_base_url: str | None = None,
+    static_dir: Path | None = None,
 ) -> Starlette:
-    """Create the hosted Starlette HTTP/MCP application.
+    """Create the hosted Starlette HTTP/MCP + read-only Web Workspace application.
 
-    - `GET /health` checks SQLite `PRAGMA quick_check` (200/503), no auth required.
+    - `GET /health` checks SQLite liveness (200/503), no auth required.
     - `/mcp` mounts FastMCP behind bearer auth + `X-Fleet-Subject` + `HubUnavailableError` -> 503.
+    - `/`, `/d/{id}`, `/api/*`, `/connections/*` serve the read-only Web Workspace behind OIDC.
     - Protected by `TrustedHostMiddleware` and sets `Cache-Control: no-store`.
     """
-    mcp = create_mcp_server(service)
+    mcp = create_mcp_server(service, public_base_url=public_base_url)
     mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
     async def _health(_request: Request) -> JSONResponse:
@@ -311,17 +343,30 @@ def create_http_app(
 
     middleware: list[Middleware] = [
         Middleware(TrustedHostMiddleware, allowed_hosts=hosts),
+    ]
+    if browser_auth is not None:
+        middleware.append(Middleware(browser_auth.middleware))
+    middleware.append(
         Middleware(
             _ScopedAuthMiddleware,  # type: ignore[arg-type]
             backend_bearer_token=backend_bearer_token,
+        )
+    )
+
+    routes: list[BaseRoute] = [
+        Route("/health", _health, methods=["GET"]),
+        *build_web_routes(
+            service,
+            browser_auth=browser_auth,
+            web_auth_resolver=web_auth_resolver,
+            public_base_url=public_base_url,
+            static_dir=static_dir,
         ),
+        Mount("/", app=mcp_app),
     ]
 
     return Starlette(
-        routes=[
-            Route("/health", _health, methods=["GET"]),
-            Mount("/", app=mcp_app),
-        ],
+        routes=routes,
         middleware=middleware,
         lifespan=mcp_app.lifespan,
     )
