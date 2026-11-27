@@ -22,6 +22,8 @@ from filings_library.url_safety import (
 HKEX_STOCK_LIST_URL = "https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json"
 HKEX_SEARCH_URL = "https://www1.hkexnews.hk/search/titleSearchServlet.do"
 HKEX_DOC_BASE = "https://www1.hkexnews.hk"
+HKEX_ROW_RANGE = 200
+MAX_SEARCH_PAGES = 20
 
 # Strictly rejected HKEX categories (noise).
 _REJECTED_T1_CODES = frozenset({"19000"})  # Overseas Regulatory Announcements
@@ -197,6 +199,8 @@ class HkexnewsAdapter:
         ref_date = today or date.today()
         from_date = ref_date - timedelta(days=365 * self._backfill_years)
 
+        records: list[dict[str, Any]] = []
+        seen_record_keys: set[str] = set()
         async with httpx.AsyncClient(
             transport=self._transport,
             timeout=self._timeout,
@@ -207,34 +211,77 @@ class HkexnewsAdapter:
             if not stock_id:
                 return []
 
-            params = {
-                "sortDir": "0",
-                "sortByOptions": "DateTime",
-                "category": "0",
-                "market": "SEHK",
-                "stockId": str(stock_id),
-                "documentType": "-1",
-                "fromDate": from_date.strftime("%Y%m%d"),
-                "toDate": ref_date.strftime("%Y%m%d"),
-                "title": "",
-                "searchType": "0",
-                "t1code": "-2",
-                "t2Gcode": "-2",
-                "t2code": "-2",
-                "rowRange": "200",
-                "lang": "E",
-            }
-            resp = await client.get(HKEX_SEARCH_URL, params=params)
-            resp.raise_for_status()
-            payload = resp.json()
+            cur_to_date = ref_date
+            for _page in range(MAX_SEARCH_PAGES):
+                if cur_to_date < from_date:
+                    break
+                params = {
+                    "sortDir": "0",
+                    "sortByOptions": "DateTime",
+                    "category": "0",
+                    "market": "SEHK",
+                    "stockId": str(stock_id),
+                    "documentType": "-1",
+                    "fromDate": from_date.strftime("%Y%m%d"),
+                    "toDate": cur_to_date.strftime("%Y%m%d"),
+                    "title": "",
+                    "searchType": "0",
+                    "t1code": "-2",
+                    "t2Gcode": "-2",
+                    "t2code": "-2",
+                    "rowRange": str(HKEX_ROW_RANGE),
+                    "lang": "E",
+                }
+                resp = await client.get(HKEX_SEARCH_URL, params=params)
+                resp.raise_for_status()
+                payload = resp.json()
 
-        raw_result = payload.get("result", [])
-        if isinstance(raw_result, str):
-            records: list[dict[str, Any]] = json.loads(raw_result) if raw_result.strip() else []
-        elif isinstance(raw_result, list):
-            records = raw_result
-        else:
-            records = []
+                raw_result = payload.get("result", [])
+                if isinstance(raw_result, str):
+                    page_records: list[dict[str, Any]] = (
+                        json.loads(raw_result) if raw_result.strip() else []
+                    )
+                elif isinstance(raw_result, list):
+                    page_records = raw_result
+                else:
+                    page_records = []
+
+                if not page_records:
+                    break
+
+                oldest_iso: str | None = None
+                for rec in page_records:
+                    if not isinstance(rec, dict):
+                        continue
+                    fdate_raw = _parse_hkex_date(
+                        str(rec.get("DATE_TIME") or rec.get("date_time") or "")
+                    )
+                    if fdate_raw and (oldest_iso is None or fdate_raw < oldest_iso):
+                        oldest_iso = fdate_raw
+                    rec_key = str(
+                        rec.get("NEWS_ID")
+                        or rec.get("news_id")
+                        or rec.get("FILE_LINK")
+                        or rec.get("file_link")
+                        or ""
+                    ).strip()
+                    if rec_key:
+                        if rec_key in seen_record_keys:
+                            continue
+                        seen_record_keys.add(rec_key)
+                    records.append(rec)
+
+                if len(page_records) < HKEX_ROW_RANGE or oldest_iso is None:
+                    break
+                try:
+                    oldest_date = date.fromisoformat(oldest_iso)
+                except ValueError:
+                    break
+                if oldest_date <= from_date:
+                    break
+                cur_to_date = (
+                    oldest_date if oldest_date < cur_to_date else cur_to_date - timedelta(days=1)
+                )
 
         cutoff = from_date.isoformat()
         candidates: list[FilingCandidate] = []

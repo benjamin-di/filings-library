@@ -682,3 +682,49 @@ def test_cli_round_trips(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     hits_after = json.loads(capsys.readouterr().out)
     assert len(hits_after) == 1
     assert hits_after[0]["source_key"] == "beta"
+
+
+def test_cli_sync_defaults_match_sync_config_and_backup_roundtrip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, datetime
+
+    from filings_library.worker import SyncConfig
+
+    args = cli.build_parser().parse_args(["sync"])
+    cfg = SyncConfig()
+    assert args.per_issuer_cap_bytes == cfg.per_issuer_cap_bytes
+    assert args.per_issuer_max_docs == cfg.per_issuer_max_docs
+    assert args.global_cap_bytes == cfg.global_cap_bytes
+
+    store, _cas, _ids = _seed_corpus(tmp_path)
+    store.close()
+    data_dir = str(tmp_path / "data")
+    backup_root = tmp_path / "backups"
+
+    # First backup succeeds and writes manifest + DB.
+    rc1 = cli.main(["backup", str(backup_root), "--data-dir", data_dir, "--json"])
+    assert rc1 == 0
+    out1 = json.loads(capsys.readouterr().out)
+    backup_dir = Path(out1["backup_dir"])
+    assert (backup_dir / "filings.sqlite3").is_file()
+    assert (backup_dir / "manifest.json").is_file()
+    assert out1["bytes"] == (backup_dir / "filings.sqlite3").stat().st_size
+
+    # Same-day second backup atomically replaces prior backup without leaving .backup-old dirs.
+    rc2 = cli.main(["backup", str(backup_root), "--data-dir", data_dir, "--json"])
+    assert rc2 == 0
+    out2 = json.loads(capsys.readouterr().out)
+    assert out2["sha256"] == out1["sha256"]
+    assert not [p for p in backup_root.iterdir() if p.name.startswith(".backup-old-")]
+
+    # Symlink at final_dir is rejected.
+    sym_root = tmp_path / "sym_backups"
+    sym_root.mkdir()
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    (sym_root / day).symlink_to(outside)
+    rc3 = cli.main(["backup", str(sym_root), "--data-dir", data_dir, "--json"])
+    assert rc3 == 1
+    assert "symlink" in capsys.readouterr().err.lower()

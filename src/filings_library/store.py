@@ -233,6 +233,12 @@ class FilingsStore:
         self.close()
 
     @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Run multiple store writes atomically in one `BEGIN IMMEDIATE` transaction."""
+        with self._tx():
+            yield
+
+    @contextmanager
     def _tx(self) -> Iterator[None]:
         if self._conn.in_transaction:
             yield
@@ -465,8 +471,7 @@ class FilingsStore:
                 """,
                 (source_key, base_form_type, period_end, before_filing_date),
             ).fetchone()
-            if row is not None:
-                return str(row["document_id"])
+            return str(row["document_id"]) if row is not None else None
         row = self._conn.execute(
             """
             SELECT document_id FROM documents
@@ -704,11 +709,28 @@ class FilingsStore:
         now_iso = current.strftime("%Y-%m-%dT%H:%M:%SZ")
         expires_iso = (current + timedelta(seconds=lease_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._tx():
+            self._conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'dead',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error = COALESCE(last_error, 'lease expired at max_attempts'),
+                    updated_at = ?
+                WHERE status = 'leased'
+                  AND lease_expires_at <= ?
+                  AND attempts >= max_attempts
+                """,
+                (now_iso, now_iso),
+            )
             row = self._conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status = 'pending'
-                   OR (status = 'leased' AND lease_expires_at <= ?)
+                WHERE (
+                    status = 'pending'
+                    OR (status = 'leased' AND lease_expires_at <= ?)
+                )
+                  AND attempts < max_attempts
                 ORDER BY id ASC
                 LIMIT 1
                 """,

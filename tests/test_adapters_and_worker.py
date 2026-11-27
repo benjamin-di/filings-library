@@ -751,3 +751,278 @@ async def test_targets_client_wraps_token_file_errors_as_hub_unavailable(tmp_pat
     with pytest.raises(HubUnavailableError) as exc_empty:
         await c_empty.fetch_targets()
     assert str(empty_file) not in str(exc_empty.value)
+
+
+@pytest.mark.asyncio
+async def test_sync_once_honors_fetched_mime_and_isolates_persist_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = b"BT /F1 12 Tf 72 720 Td (Consolidated Revenue 99,888 million) Tj ET\n"
+    objs = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        (
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>\nendobj\n"
+        ),
+        (
+            f"5 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode()
+            + stream
+            + b"endstream\nendobj\n"
+        ),
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offs = [0]
+    for obj in objs:
+        offs.append(len(out))
+        out.extend(obj)
+    xref = len(out)
+    out.extend(f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode())
+    for off in offs[1:]:
+        out.extend(f"{off:010d} 00000 n \n".encode())
+    out.extend(
+        f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    )
+    pdf_bytes = bytes(out)
+
+    store = FilingsStore(tmp_path / "library.sqlite3")
+    cas = ContentAddressedStore(tmp_path / "cas")
+
+    targets_payload = {
+        "schema": 1,
+        "generated_at": "2026-11-26T00:00:00Z",
+        "companies": [
+            {
+                "source_key": "co-pdf",
+                "ticker": "CPDF",
+                "exchange": "XNAS",
+                "name": "Co PDF",
+                "verified_documents": [
+                    {
+                        "id": "ew-pdf",
+                        "event_id": "ev-1",
+                        "url": "https://ir.example.test/download?id=42",
+                        "title": "Q3 Release",
+                        "role": "results_release",
+                        "first_seen": "2026-11-01T00:00:00Z",
+                    }
+                ],
+            },
+            {
+                "source_key": "co-bad",
+                "ticker": "CBAD",
+                "exchange": "XNAS",
+                "name": "Co Bad",
+                "verified_documents": [
+                    {
+                        "id": "ew-bad",
+                        "event_id": "ev-2",
+                        "url": "https://ir.example.test/bad.html",
+                        "title": "Bad Persist",
+                        "role": "results_release",
+                        "first_seen": "2026-11-01T00:00:00Z",
+                    }
+                ],
+            },
+            {
+                "source_key": "co-ok",
+                "ticker": "COK",
+                "exchange": "XNAS",
+                "name": "Co OK",
+                "verified_documents": [
+                    {
+                        "id": "ew-ok",
+                        "event_id": "ev-3",
+                        "url": "https://ir.example.test/ok.html",
+                        "title": "OK Release",
+                        "role": "results_release",
+                        "first_seen": "2026-11-01T00:00:00Z",
+                    }
+                ],
+            },
+        ],
+        "scopes": [],
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/internal/library-targets"):
+            return httpx.Response(200, json=targets_payload)
+        if "download?id=42" in url:
+            return httpx.Response(
+                200, headers={"Content-Type": "application/pdf"}, content=pdf_bytes
+            )
+        if url.endswith("/bad.html"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<html><body><p>Bad doc</p></body></html>",
+            )
+        if url.endswith("/ok.html"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<html><body><p>Healthy doc</p></body></html>",
+            )
+        return httpx.Response(404)
+
+    orig_replace = store.replace_sections
+
+    def _flaky_replace(document_id: str, sections: Any) -> None:
+        doc = store.get_document(document_id)
+        if doc is not None and doc.source_key == "co-bad":
+            raise RuntimeError("simulated mid-transaction section failure")
+        orig_replace(document_id, sections)
+
+    monkeypatch.setattr(store, "replace_sections", _flaky_replace)
+
+    transport = httpx.MockTransport(_handler)
+    tc = LibraryTargetsClient(base_url="https://hub.example.test", token="t", transport=transport)
+    try:
+        res = await sync_once(
+            store=store,
+            cas=cas,
+            targets_client=tc,
+            extractor_client=ExtractorClient.in_process(),
+            download_transport=transport,
+            url_resolver=_public_test_resolver,
+            today=date(2026, 11, 26),
+        )
+        # 1. Extensionless URL with Content-Type: application/pdf extracted as PDF.
+        pdf_docs = store.list_documents({"co-pdf"})
+        assert len(pdf_docs) == 1
+        assert pdf_docs[0].source_mime == "application/pdf"
+        assert pdf_docs[0].converter_id == "pdf-poppler-tesseract"
+        assert pdf_docs[0].page_count == 1
+        assert "99,888" in store.get_sections(pdf_docs[0].document_id)[0].markdown
+
+        # 2. Persistence error on co-bad rolled back documents row (no zombie) and did not abort co-ok.
+        assert store.list_documents({"co-bad"}) == []
+        assert len(store.list_documents({"co-ok"})) == 1
+        assert res.documents_ingested == 2
+        assert any("persist ew-bad" in e for e in res.errors)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_sec_edgar_follows_overflow_files_and_hkexnews_paginates() -> None:
+    # 1. SEC EDGAR overflow files when recent does not reach cutoff.
+    submissions_main = {
+        "cik": "0000123456",
+        "filings": {
+            "recent": {
+                "form": ["8-K"],
+                "accessionNumber": ["0000123456-26-000050"],
+                "filingDate": ["2026-10-01"],
+                "reportDate": ["2026-10-01"],
+                "primaryDocument": ["recent-8k.htm"],
+                "primaryDocDescription": ["Recent 8-K"],
+                "items": [["2.02"]],
+            },
+            "files": [
+                {
+                    "name": "CIK0000123456-submissions-001.json",
+                    "filingFrom": "2024-01-01",
+                    "filingTo": "2026-09-30",
+                },
+                {
+                    "name": "CIK0000123456-submissions-002.json",
+                    "filingFrom": "2018-01-01",
+                    "filingTo": "2020-12-31",  # older than 3-year cutoff, must not be fetched
+                },
+                {
+                    "name": "../evil.json",  # traversal rejected
+                    "filingFrom": "2025-01-01",
+                    "filingTo": "2026-01-01",
+                },
+            ],
+        },
+    }
+    overflow_001 = {
+        "form": ["10-K"],
+        "accessionNumber": ["0000123456-25-000001"],
+        "filingDate": ["2025-02-20"],
+        "reportDate": ["2024-12-31"],
+        "primaryDocument": ["ar2024.htm"],
+        "primaryDocDescription": ["Annual Report 2024"],
+        "items": [[]],
+    }
+
+    fetched_sec_urls: list[str] = []
+
+    def _sec_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        fetched_sec_urls.append(url)
+        if url.endswith("CIK0000123456.json"):
+            return httpx.Response(200, json=submissions_main)
+        if url.endswith("CIK0000123456-submissions-001.json"):
+            return httpx.Response(200, json=overflow_001)
+        return httpx.Response(404)
+
+    sec = SecEdgarAdapter(
+        user_agent=SEC_UA,
+        backfill_years=3,
+        transport=httpx.MockTransport(_sec_handler),
+        resolver=_public_test_resolver,
+    )
+    us_co = CompanyTarget(
+        source_key="big-filer", ticker="BIG", exchange="XNAS", name="Big Filer", sec_cik=123456
+    )
+    sec_cands = await sec.discover(us_co, today=date(2026, 11, 26))
+    assert {c.form_type for c in sec_cands} == {"8-K", "10-K"}
+    assert not any("submissions-002.json" in u for u in fetched_sec_urls)
+
+    # 2. HKEXnews paginates past 200 noise records to recover older annual report.
+    page1_records = [
+        {
+            "NEWS_ID": f"noise-{i}",
+            "t1_code": "10000",
+            "t2_code": "16300",
+            "TITLE": "Next Day Disclosure Return",
+            "DATE_TIME": "15/06/2026 17:00" if i == 199 else "01/11/2026 17:00",
+            "FILE_LINK": f"/listedco/listconews/sehk/2026/noise-{i}.pdf",
+            "SHORT_TEXT": "Next Day Disclosure Return",
+        }
+        for i in range(200)
+    ]
+    page2_records = [
+        page1_records[-1],  # duplicate boundary record must be deduplicated
+        {
+            "NEWS_ID": "ar-2025",
+            "t1_code": "40000",
+            "t2_code": "40100",
+            "TITLE": "Annual Report 2025",
+            "DATE_TIME": "20/04/2026 17:30",
+            "FILE_LINK": "/listedco/listconews/sehk/2026/0420/ar2025.pdf",
+            "SHORT_TEXT": "Annual Report",
+        },
+    ]
+
+    hk_to_dates: list[str] = []
+
+    def _hk_handler(request: httpx.Request) -> httpx.Response:
+        to_date = request.url.params.get("toDate", "")
+        hk_to_dates.append(to_date)
+        if to_date == "20261126":
+            return httpx.Response(200, json={"result": json.dumps(page1_records)})
+        if to_date == "20260615":
+            return httpx.Response(200, json={"result": json.dumps(page2_records)})
+        return httpx.Response(200, json={"result": "[]"})
+
+    hkex = HkexnewsAdapter(
+        backfill_years=3,
+        transport=httpx.MockTransport(_hk_handler),
+        resolver=_public_test_resolver,
+    )
+    hk_co = CompanyTarget(
+        source_key="active-hk",
+        ticker="0700.HK",
+        exchange="XHKG",
+        name="Active HK",
+        hkex_stock_id="99901",
+    )
+    hk_cands = await hkex.discover(hk_co, today=date(2026, 11, 26))
+    assert hk_to_dates == ["20261126", "20260615"]
+    assert [c.external_id for c in hk_cands] == ["ar-2025"]

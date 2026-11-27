@@ -45,12 +45,17 @@ _ADAPTER_ALLOWED_HOSTS: dict[SourceAdapter, frozenset[str] | None] = {
 }
 
 
+DEFAULT_PER_ISSUER_CAP_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB
+DEFAULT_PER_ISSUER_MAX_DOCS = 500
+_GENERIC_MIME_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
+
+
 @dataclass(frozen=True)
 class SyncConfig:
     backfill_years: int = 3
     global_cap_bytes: int = DEFAULT_GLOBAL_CAP_BYTES
-    per_issuer_cap_bytes: int = 5 * 1024 * 1024 * 1024  # 5 GiB
-    per_issuer_max_docs: int = 500
+    per_issuer_cap_bytes: int = DEFAULT_PER_ISSUER_CAP_BYTES
+    per_issuer_max_docs: int = DEFAULT_PER_ISSUER_MAX_DOCS
     sec_user_agent: str | None = None
     download_timeout: float = 60.0
     max_download_bytes: int = MAX_EXTRACT_BYTES
@@ -249,8 +254,11 @@ async def sync_once(
                 result.documents_skipped_quota += 1
                 continue
 
-            source_sha256 = cas.put_bytes(raw_bytes)
-            mime_type = cand.source_mime or fetched_mime or "application/octet-stream"
+            mime_type = (
+                fetched_mime
+                if fetched_mime not in _GENERIC_MIME_TYPES
+                else (cand.source_mime or fetched_mime or "application/octet-stream")
+            )
             filename = _filename_from_url(cand.source_url)
 
             try:
@@ -263,7 +271,7 @@ async def sync_once(
 
             md_bytes = extracted.markdown.encode("utf-8")
             md_quota = store.check_quota(
-                len(md_bytes),
+                len(raw_bytes) + len(md_bytes),
                 source_key=company.source_key,
                 global_cap_bytes=cfg.global_cap_bytes,
                 per_issuer_cap_bytes=cfg.per_issuer_cap_bytes,
@@ -273,15 +281,8 @@ async def sync_once(
                 result.documents_skipped_quota += 1
                 continue
 
+            source_sha256 = cas.put_bytes(raw_bytes)
             md_sha256 = cas.put_bytes(md_bytes)
-            store.put_artifact(
-                source_sha256=source_sha256,
-                kind=ArtifactKind.MARKDOWN,
-                converter_id=extracted.converter_id,
-                converter_version=extracted.converter_version,
-                artifact_sha256=md_sha256,
-                byte_size=len(md_bytes),
-            )
 
             supersedes_id: str | None = None
             if cand.is_amendment and cand.base_form_type:
@@ -316,8 +317,21 @@ async def sync_once(
                 markdown_sha256=md_sha256,
                 page_count=extracted.page_count,
             )
-            store.upsert_document(doc_record)
-            store.replace_sections(doc_id, extracted.sections)
+            try:
+                with store.transaction():
+                    store.put_artifact(
+                        source_sha256=source_sha256,
+                        kind=ArtifactKind.MARKDOWN,
+                        converter_id=extracted.converter_id,
+                        converter_version=extracted.converter_version,
+                        artifact_sha256=md_sha256,
+                        byte_size=len(md_bytes),
+                    )
+                    store.upsert_document(doc_record)
+                    store.replace_sections(doc_id, extracted.sections)
+            except Exception as exc:
+                result.errors.append(f"persist {cand.external_id}: {exc}")
+                continue
             result.documents_ingested += 1
 
         # Fetch SEC XBRL companyfacts if company has a CIK and SEC adapter is active.

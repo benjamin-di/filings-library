@@ -400,3 +400,36 @@ async def test_stateless_extractor_http_asgi_service() -> None:
     )
     assert pdf_res.page_count == 1
     assert pdf_res.sections[0].locator == "page:1"
+
+
+def test_unique_locators_for_xlsx_index_sheet_and_colliding_html_headings() -> None:
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    assert ws1 is not None
+    ws1.title = "Index"
+    ws1.append(["Tab", "Purpose"])
+    ws1.append(["Summary", "Key Metrics"])
+    ws2 = wb.create_sheet("Summary")
+    ws2.append(["Metric", "Val"])
+    ws3 = wb.create_sheet("Summary 2")
+    ws3.append(["Metric", "Val"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    wb.close()
+
+    ext_xlsx = extract_xlsx(buf.getvalue())
+    xlsx_locs = [s.locator for s in ext_xlsx.sections]
+    assert len(xlsx_locs) == len(set(xlsx_locs))
+    assert xlsx_locs[0] == "section:sheet-index"
+    assert xlsx_locs[1] == "section:sheet-index-2"
+
+    html = (
+        "<html><body>"
+        "<h2>Overview</h2><p>A</p>"
+        "<h2>Overview</h2><p>B</p>"
+        "<h2>Overview 2</h2><p>C</p>"
+        "</body></html>"
+    )
+    ext_html = extract_html_ixbrl(html)
+    html_locs = [s.locator for s in ext_html.sections]
+    assert html_locs == ["section:overview", "section:overview-2", "section:overview-2-2"]

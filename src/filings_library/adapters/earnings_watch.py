@@ -35,7 +35,11 @@ def _guess_mime(url: str) -> str:
         return "application/pdf"
     if lower.endswith(".xlsx"):
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    return "text/html"
+    if lower.endswith((".htm", ".html")):
+        return "text/html"
+    if lower.endswith(".xhtml"):
+        return "application/xhtml+xml"
+    return ""
 
 
 def _parse_iso_date(raw: str | None) -> str:

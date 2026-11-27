@@ -46,15 +46,19 @@ def _slugify(text: str) -> str:
     return slug[:64] or "section"
 
 
-def _locator_for_heading(heading: str, seen: dict[str, int]) -> str:
+def _locator_for_heading(heading: str, allocated: set[str]) -> str:
     item_match = _ITEM_HEADING_RE.match(heading)
     if item_match:
         base = f"item:{item_match.group(1).lower()}"
     else:
         base = f"section:{_slugify(heading)}"
-    count = seen.get(base, 0) + 1
-    seen[base] = count
-    return base if count == 1 else f"{base}-{count}"
+    locator = base
+    suffix = 2
+    while locator in allocated:
+        locator = f"{base}-{suffix}"
+        suffix += 1
+    allocated.add(locator)
+    return locator
 
 
 def _parse_span(value: object) -> int:
@@ -278,7 +282,7 @@ def extract_html_ixbrl(data: bytes | str) -> ExtractedDocument:
     body = soup.body if soup.body is not None else soup
     blocks = _collect_blocks(body)
 
-    seen_locators: dict[str, int] = {}
+    seen_locators: set[str] = set()
     sections: list[ExtractedSection] = []
     cur_title = ""
     cur_locator = ""

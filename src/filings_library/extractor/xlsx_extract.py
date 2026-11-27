@@ -42,7 +42,7 @@ def extract_xlsx(
         "| Sheet | Rows | Columns | Locator |",
         "| --- | --- | --- | --- |",
     ]
-    seen_locators: dict[str, int] = {}
+    allocated_locators: set[str] = {"section:sheet-index"}
 
     try:
         for sheet_name in wb.sheetnames:
@@ -68,9 +68,12 @@ def extract_xlsx(
                     rows.append(formatted)
 
             base_loc = f"section:sheet-{_slugify(sheet_name)}"
-            cnt = seen_locators.get(base_loc, 0) + 1
-            seen_locators[base_loc] = cnt
-            locator = base_loc if cnt == 1 else f"{base_loc}-{cnt}"
+            locator = base_loc
+            suffix = 2
+            while locator in allocated_locators:
+                locator = f"{base_loc}-{suffix}"
+                suffix += 1
+            allocated_locators.add(locator)
 
             if truncated_rows:
                 warnings.append(f"Sheet {sheet_name!r} truncated at {max_rows_per_sheet} rows")

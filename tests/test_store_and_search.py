@@ -518,3 +518,79 @@ def test_fts5_hostile_queries_and_limit_clamping(tmp_path: Path) -> None:
         assert read_res["truncated"] is True
     finally:
         store.close()
+
+
+def test_find_superseded_document_does_not_cross_fiscal_periods(tmp_path: Path) -> None:
+    store = FilingsStore(tmp_path / "library.sqlite3")
+    try:
+        store.upsert_company(_make_company("period-co", "PRD", "Period Co"))
+        store.upsert_document(
+            _make_doc(
+                doc_id="doc-2024-10k",
+                source_key="period-co",
+                external_id="10k-2024",
+                form_type="10-K",
+                form_family=FormFamily.ANNUAL_REPORT,
+                filing_date="2025-02-20",
+                period_end="2024-12-31",
+            )
+        )
+        # Late FY2023 10-K/A must NOT supersede FY2024 10-K when FY2023 10-K is absent.
+        assert (
+            store.find_superseded_document_id(
+                source_key="period-co",
+                base_form_type="10-K",
+                period_end="2023-12-31",
+                before_filing_date="2025-03-10",
+            )
+            is None
+        )
+        # Same period_end still matches.
+        assert (
+            store.find_superseded_document_id(
+                source_key="period-co",
+                base_form_type="10-K",
+                period_end="2024-12-31",
+                before_filing_date="2025-03-10",
+            )
+            == "doc-2024-10k"
+        )
+        # Undated amendment (period_end=None) falls back to latest prior base filing.
+        assert (
+            store.find_superseded_document_id(
+                source_key="period-co",
+                base_form_type="10-K",
+                period_end=None,
+                before_filing_date="2025-03-10",
+            )
+            == "doc-2024-10k"
+        )
+    finally:
+        store.close()
+
+
+def test_lease_job_dead_letters_expired_lease_at_max_attempts(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    store = FilingsStore(tmp_path / "library.sqlite3")
+    try:
+        job_id = store.enqueue_job("extract", {"document_id": "poison"}, max_attempts=2)
+        t0 = datetime(2026, 11, 26, 0, 0, tzinfo=UTC)
+
+        j1 = store.lease_job("w1", lease_seconds=60, now=t0)
+        assert j1 is not None and j1["id"] == job_id and j1["attempts"] == 1
+
+        j2 = store.lease_job("w2", lease_seconds=60, now=t0 + timedelta(seconds=120))
+        assert j2 is not None and j2["id"] == job_id and j2["attempts"] == 2
+
+        # Third attempt after lease expiry must dead-letter the job and return None.
+        j3 = store.lease_job("w3", lease_seconds=60, now=t0 + timedelta(seconds=240))
+        assert j3 is None
+        row = store.conn.execute(
+            "SELECT status, attempts FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "dead"
+        assert int(row["attempts"]) == 2
+    finally:
+        store.close()

@@ -24,7 +24,13 @@ from filings_library.service import (
 )
 from filings_library.store import DEFAULT_GLOBAL_CAP_BYTES, FilingsStore
 from filings_library.targets_client import LibraryTargetsClient
-from filings_library.worker import SyncConfig, export_markdown, sync_once
+from filings_library.worker import (
+    DEFAULT_PER_ISSUER_CAP_BYTES,
+    DEFAULT_PER_ISSUER_MAX_DOCS,
+    SyncConfig,
+    export_markdown,
+    sync_once,
+)
 
 DEFAULT_DATA_DIR = "data"
 DB_FILENAME = "filings.sqlite3"
@@ -188,8 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sync.add_argument("--backfill-years", type=int, default=3)
     p_sync.add_argument("--global-cap-bytes", type=int, default=DEFAULT_GLOBAL_CAP_BYTES)
-    p_sync.add_argument("--per-issuer-cap-bytes", type=int, default=512 * 1024 * 1024)
-    p_sync.add_argument("--per-issuer-max-docs", type=int, default=200)
+    p_sync.add_argument("--per-issuer-cap-bytes", type=int, default=DEFAULT_PER_ISSUER_CAP_BYTES)
+    p_sync.add_argument("--per-issuer-max-docs", type=int, default=DEFAULT_PER_ISSUER_MAX_DOCS)
     p_sync.add_argument("--json", action="store_true", dest="as_json")
 
     # search
@@ -460,6 +466,8 @@ def _cmd_backup(args: argparse.Namespace) -> int:
         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
         day = datetime.now(UTC).strftime("%Y-%m-%d")
         final_dir = out_root / day
+        if final_dir.is_symlink():
+            raise ValueError(f"backup target must not be a symlink: {final_dir}")
         stage_dir = Path(tempfile.mkdtemp(prefix=f".backup-{day}-", dir=out_root))
         try:
             dst_db = stage_dir / "filings.sqlite3"
@@ -475,20 +483,34 @@ def _cmd_backup(args: argparse.Namespace) -> int:
                     dst_conn.close()
             finally:
                 src_conn.close()
-            sha = hashlib.sha256(dst_db.read_bytes()).hexdigest()
+            with dst_db.open("rb") as fh:
+                sha = hashlib.file_digest(fh, "sha256").hexdigest()
+            size_bytes = dst_db.stat().st_size
             manifest = {
                 "schema": 1,
                 "created_at": datetime.now(UTC).isoformat(),
                 "day": day,
-                "files": {"filings.sqlite3": {"sha256": sha, "bytes": dst_db.stat().st_size}},
+                "files": {"filings.sqlite3": {"sha256": sha, "bytes": size_bytes}},
             }
             (stage_dir / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
+            old_dir: Path | None = None
+            if final_dir.is_symlink():
+                raise ValueError(f"backup target must not be a symlink: {final_dir}")
             if final_dir.exists():
-                shutil.rmtree(final_dir)
-            size_bytes = dst_db.stat().st_size
-            os.replace(stage_dir, final_dir)
+                old_dir = out_root / f".backup-old-{day}-{os.getpid()}"
+                if old_dir.exists():
+                    shutil.rmtree(old_dir)
+                os.replace(final_dir, old_dir)
+            try:
+                os.replace(stage_dir, final_dir)
+            except Exception:
+                if old_dir is not None and old_dir.exists() and not final_dir.exists():
+                    os.replace(old_dir, final_dir)
+                raise
+            if old_dir is not None and old_dir.exists():
+                shutil.rmtree(old_dir, ignore_errors=True)
             payload = {
                 "backup_dir": str(final_dir),
                 "sha256": sha,

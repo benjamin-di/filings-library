@@ -18,9 +18,11 @@ from filings_library.url_safety import (
     validate_public_https_url,
 )
 
-SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+SEC_SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
+SEC_SUBMISSIONS_URL = f"{SEC_SUBMISSIONS_BASE}/CIK{{cik:010d}}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
+MAX_OVERFLOW_FILES = 10
 
 _ALLOWED_FORMS = frozenset(
     {"10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A", "6-K", "8-K", "DEF 14A"}
@@ -160,93 +162,139 @@ class SecEdgarAdapter:
             resp.raise_for_status()
             payload = resp.json()
 
-            recent = payload.get("filings", {}).get("recent", {})
-            forms: list[str] = recent.get("form", [])
-            accession_numbers: list[str] = recent.get("accessionNumber", [])
-            filing_dates: list[str] = recent.get("filingDate", [])
-            report_dates: list[str] = recent.get("reportDate", [])
-            primary_docs: list[str] = recent.get("primaryDocument", [])
-            primary_descs: list[str] = recent.get("primaryDocDescription", [])
-            items_list: list[Any] = recent.get("items", [])
+            filings_obj = payload.get("filings", {})
+            recent = filings_obj.get("recent", {})
+            blocks: list[dict[str, Any]] = [recent] if isinstance(recent, dict) else []
+
+            recent_dates = [
+                str(d).strip()
+                for d in (recent.get("filingDate", []) if isinstance(recent, dict) else [])
+                if str(d).strip()
+            ]
+            overflow_files = filings_obj.get("files", []) if isinstance(filings_obj, dict) else []
+            if isinstance(overflow_files, list) and (
+                not recent_dates or min(recent_dates) >= cutoff
+            ):
+                fetched_overflow = 0
+                for file_meta in overflow_files:
+                    if fetched_overflow >= MAX_OVERFLOW_FILES:
+                        break
+                    if not isinstance(file_meta, dict):
+                        continue
+                    filing_to = str(file_meta.get("filingTo") or "").strip()
+                    if filing_to and filing_to < cutoff:
+                        continue
+                    file_name = str(file_meta.get("name") or "").strip()
+                    if not _is_safe_doc_name(file_name) or not file_name.endswith(".json"):
+                        continue
+                    try:
+                        overflow_url = validate_public_https_url(
+                            f"{SEC_SUBMISSIONS_BASE}/{file_name}",
+                            allowed_hosts=SEC_ALLOWED_HOSTS,
+                            resolver=self._resolver,
+                        )
+                    except UnsafeUrlError:
+                        continue
+                    overflow_resp = await client.get(overflow_url)
+                    if overflow_resp.status_code == 200:
+                        overflow_data = overflow_resp.json()
+                        if isinstance(overflow_data, dict):
+                            blocks.append(overflow_data)
+                            fetched_overflow += 1
 
             candidates: list[FilingCandidate] = []
-            count = min(len(forms), len(accession_numbers), len(filing_dates), len(primary_docs))
-            for idx in range(count):
-                form = str(forms[idx]).strip().upper()
-                if form not in _ALLOWED_FORMS:
-                    continue
-                fdate = str(filing_dates[idx]).strip()
-                if not fdate or fdate < cutoff:
-                    continue
+            seen_accns: set[str] = set()
+            for block in blocks:
+                forms: list[str] = block.get("form", [])
+                accession_numbers: list[str] = block.get("accessionNumber", [])
+                filing_dates: list[str] = block.get("filingDate", [])
+                report_dates: list[str] = block.get("reportDate", [])
+                primary_docs: list[str] = block.get("primaryDocument", [])
+                primary_descs: list[str] = block.get("primaryDocDescription", [])
+                items_list: list[Any] = block.get("items", [])
 
-                if form == "8-K":
-                    raw_items = items_list[idx] if idx < len(items_list) else []
-                    if isinstance(raw_items, str):
-                        item_set = {s.strip() for s in raw_items.split(",") if s.strip()}
-                    elif isinstance(raw_items, list):
-                        item_set = {str(s).strip() for s in raw_items}
-                    else:
-                        item_set = set()
-                    if not (item_set & _ALLOWED_8K_ITEMS):
+                count = min(
+                    len(forms), len(accession_numbers), len(filing_dates), len(primary_docs)
+                )
+                for idx in range(count):
+                    form = str(forms[idx]).strip().upper()
+                    if form not in _ALLOWED_FORMS:
+                        continue
+                    fdate = str(filing_dates[idx]).strip()
+                    if not fdate or fdate < cutoff:
                         continue
 
-                accn = str(accession_numbers[idx]).strip()
-                accn_nodash = accn.replace("-", "")
-                if not accn_nodash or not accn_nodash.isdigit():
-                    continue
-                primary_doc = str(primary_docs[idx]).strip()
-                selected_doc = primary_doc
+                    if form == "8-K":
+                        raw_items = items_list[idx] if idx < len(items_list) else []
+                        if isinstance(raw_items, str):
+                            item_set = {s.strip() for s in raw_items.split(",") if s.strip()}
+                        elif isinstance(raw_items, list):
+                            item_set = {str(s).strip() for s in raw_items}
+                        else:
+                            item_set = set()
+                        if not (item_set & _ALLOWED_8K_ITEMS):
+                            continue
 
-                if form == "6-K":
-                    index_url = validate_public_https_url(
-                        f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/index.json",
-                        allowed_hosts=SEC_ALLOWED_HOSTS,
-                        resolver=self._resolver,
+                    accn = str(accession_numbers[idx]).strip()
+                    if accn in seen_accns:
+                        continue
+                    accn_nodash = accn.replace("-", "")
+                    if not accn_nodash or not accn_nodash.isdigit():
+                        continue
+                    primary_doc = str(primary_docs[idx]).strip()
+                    selected_doc = primary_doc
+
+                    if form == "6-K":
+                        index_url = validate_public_https_url(
+                            f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/index.json",
+                            allowed_hosts=SEC_ALLOWED_HOSTS,
+                            resolver=self._resolver,
+                        )
+                        idx_resp = await client.get(index_url)
+                        if idx_resp.status_code == 200:
+                            selected_doc = _select_6k_exhibit(idx_resp.json(), primary_doc)
+
+                    if not _is_safe_doc_name(selected_doc):
+                        continue
+
+                    period_end = (
+                        str(report_dates[idx]).strip() or None if idx < len(report_dates) else None
                     )
-                    idx_resp = await client.get(index_url)
-                    if idx_resp.status_code == 200:
-                        selected_doc = _select_6k_exhibit(idx_resp.json(), primary_doc)
-
-                if not _is_safe_doc_name(selected_doc):
-                    continue
-
-                period_end = (
-                    str(report_dates[idx]).strip() or None if idx < len(report_dates) else None
-                )
-                desc = (
-                    str(primary_descs[idx]).strip()
-                    if idx < len(primary_descs) and primary_descs[idx]
-                    else f"{company.name} {form}"
-                )
-                is_amendment = form.endswith("/A")
-                base_form = form[:-2] if is_amendment else form
-                try:
-                    source_url = validate_public_https_url(
-                        f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/{selected_doc}",
-                        allowed_hosts=SEC_ALLOWED_HOSTS,
-                        resolver=self._resolver,
+                    desc = (
+                        str(primary_descs[idx]).strip()
+                        if idx < len(primary_descs) and primary_descs[idx]
+                        else f"{company.name} {form}"
                     )
-                except UnsafeUrlError:
-                    continue
+                    is_amendment = form.endswith("/A")
+                    base_form = form[:-2] if is_amendment else form
+                    try:
+                        source_url = validate_public_https_url(
+                            f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/{selected_doc}",
+                            allowed_hosts=SEC_ALLOWED_HOSTS,
+                            resolver=self._resolver,
+                        )
+                    except UnsafeUrlError:
+                        continue
 
-                candidates.append(
-                    FilingCandidate(
-                        source_key=company.source_key,
-                        adapter=SourceAdapter.SEC_EDGAR,
-                        external_id=f"{accn}:{selected_doc}",
-                        form_type=form,
-                        form_family=_FORM_FAMILY_MAP[form],
-                        title=desc,
-                        filing_date=fdate,
-                        period_end=period_end,
-                        source_url=source_url,
-                        source_mime=_guess_mime(selected_doc),
-                        language="en",
-                        refetchable=True,
-                        is_amendment=is_amendment,
-                        base_form_type=base_form,
+                    seen_accns.add(accn)
+                    candidates.append(
+                        FilingCandidate(
+                            source_key=company.source_key,
+                            adapter=SourceAdapter.SEC_EDGAR,
+                            external_id=f"{accn}:{selected_doc}",
+                            form_type=form,
+                            form_family=_FORM_FAMILY_MAP[form],
+                            title=desc,
+                            filing_date=fdate,
+                            period_end=period_end,
+                            source_url=source_url,
+                            source_mime=_guess_mime(selected_doc),
+                            language="en",
+                            refetchable=True,
+                            is_amendment=is_amendment,
+                            base_form_type=base_form,
+                        )
                     )
-                )
 
         return candidates
 
