@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.2] - 2026-11-28
+
+### Fixed
+- Parse native `local-transcriber` Parakeet worker JSON wire format (`transcription` with millisecond `offsets.from`/`offsets.to`) in `parse_parakeet_segments()`.
+
+### Upgrade
+- Action required: none.
+- Rollback: compatible with 0.5.1.
+
 ## [0.5.1] - 2026-11-28
 
 ### Fixed
