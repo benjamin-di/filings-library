@@ -104,11 +104,23 @@ class EarningsWatchAdapter:
         del today
         candidates: list[FilingCandidate] = []
         seen_urls: set[str] = set()
+        ir_asset_id_by_url: dict[str, str] = {}
+        for hint in company.ir_assets:
+            raw_url = hint.url.strip()
+            asset_id = hint.id.strip()
+            if not raw_url or not asset_id:
+                continue
+            try:
+                safe_url = validate_public_https_url(raw_url, resolver=self._resolver)
+            except UnsafeUrlError:
+                continue
+            ir_asset_id_by_url.setdefault(safe_url, asset_id)
+
         hint_sources = [
-            *((hint, True) for hint in company.verified_documents),
-            *((hint, False) for hint in company.ir_assets),
+            *((hint, True, False) for hint in company.verified_documents),
+            *((hint, False, True) for hint in company.ir_assets),
         ]
-        for hint, allow_first_seen_fallback in hint_sources:
+        for hint, allow_first_seen_fallback, is_ir_asset in hint_sources:
             raw_url = hint.url.strip()
             if not raw_url:
                 continue
@@ -119,6 +131,9 @@ class EarningsWatchAdapter:
             if safe_url in seen_urls:
                 continue
             seen_urls.add(safe_url)
+            ir_asset_id = (
+                (hint.id.strip() or None) if is_ir_asset else ir_asset_id_by_url.get(safe_url)
+            )
             category = normalize_document_category(hint.category or hint.role or "other")
             form_family = _CATEGORY_TO_FAMILY.get(category, FormFamily.RESULTS_RELEASE)
             if hint.published_date:
@@ -154,6 +169,7 @@ class EarningsWatchAdapter:
                     language="en",
                     refetchable=False,
                     is_amendment=False,
+                    ir_asset_id=ir_asset_id,
                 )
             )
         return candidates

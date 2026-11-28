@@ -25,3 +25,4 @@ class FilingCandidate:
     refetchable: bool = True
     is_amendment: bool = False
     base_form_type: str | None = None
+    ir_asset_id: str | None = None

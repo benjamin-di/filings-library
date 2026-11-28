@@ -533,6 +533,28 @@ async def sync_once(
                     allowed_hosts=_ADAPTER_ALLOWED_HOSTS.get(cand.adapter),
                     resolver=url_resolver,
                 )
+            except httpx.HTTPStatusError as exc:
+                download_ir_asset = getattr(targets_client, "download_ir_asset", None)
+                if (
+                    exc.response.status_code == 403
+                    and cand.adapter == SourceAdapter.EARNINGS_WATCH
+                    and cand.ir_asset_id
+                    and callable(download_ir_asset)
+                ):
+                    try:
+                        raw_bytes, fetched_mime = await targets_client.download_ir_asset(
+                            cand.ir_asset_id,
+                            max_bytes=cfg.max_download_bytes,
+                        )
+                    except Exception as fallback_exc:
+                        result.errors.append(
+                            f"download {cand.source_url}: {exc}; "
+                            f"ir_asset fallback {cand.ir_asset_id}: {fallback_exc}"
+                        )
+                        continue
+                else:
+                    result.errors.append(f"download {cand.source_url}: {exc}")
+                    continue
             except Exception as exc:
                 result.errors.append(f"download {cand.source_url}: {exc}")
                 continue
