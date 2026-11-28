@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.0] - 2026-11-28
+
+### Changed
+- Retire and remove legacy `IssuerIrAdapter` and purge leftover `issuer_ir` document/section/FTS rows and `ir_gap_backfill` jobs on startup without touching CAS blobs.
+- Reclassify routine SEC `6-K` share/governance noise (buybacks, TVR, PDMR, block listings, holdings) as `current_report` while guarding financial results headlines.
+- Prioritize `per_issuer_max_docs` newest-first while preserving oldest-first amendment supersession, deduplicate cross-adapter URLs and SHA-256 content hashes, check HKEXnews multi-tag financial results before overseas regulatory announcements, and deduplicate ESEF filings by `(period_end, language)`.
+
+### Added
+- Add SSRF-safe `AsxAdapter` using MarkitDigital JSON API with ASX HTML fallback for ASX-listed issuers.
+- Add WAF HTTP 403 fallback via `LibraryTargetsClient.download_ir_asset()` (`GET /internal/ir-assets/{asset_id}/download`) strictly for verified `earnings_watch` IR asset candidates.
+- Extract Item 2.02 `8-K` `EX-99.1` earnings exhibits with SQLite `sec_index_cache` caching.
+
+### Upgrade
+- Action required: none.
+- Rollback: compatible with 0.5.2 (startup migration purges retired `issuer_ir` rows and `ir_gap_backfill` jobs and creates `sec_index_cache` idempotently without modifying CAS blobs).
+
 ## [0.5.2] - 2026-11-28
 
 ### Fixed
