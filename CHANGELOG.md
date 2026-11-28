@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1] - 2026-11-28
+
+### Fixed
+- Publish `release/compatibility.json` metadata for the 0.5.x IR presentations, transcripts, PPTX, and Parakeet ASR release line.
+
+### Upgrade
+- Action required: none.
+- Rollback: compatible with 0.4.2.
+
 ## [0.5.0] - 2026-11-28
 
 ### Added
