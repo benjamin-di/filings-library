@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -23,9 +23,24 @@ from filings_library.adapters.issuer_ir import IssuerIrAdapter
 from filings_library.adapters.sec_edgar import SecEdgarAdapter
 from filings_library.cas import ContentAddressedStore, SymlinkRejectedError
 from filings_library.extractor.app import MAX_EXTRACT_BYTES, ExtractorClient
-from filings_library.models import ArtifactKind, DocumentRecord, SourceAdapter
+from filings_library.models import (
+    ArtifactKind,
+    DocumentRecord,
+    ExtractedDocument,
+    ExtractedSection,
+    FormFamily,
+    SourceAdapter,
+)
 from filings_library.store import DEFAULT_GLOBAL_CAP_BYTES, FilingsStore
 from filings_library.targets_client import LibraryTargetsClient
+from filings_library.transcribe import (
+    ASR_FORM_TYPE,
+    normalize_audio_to_wav,
+    parse_parakeet_segments,
+    run_remote_parakeet,
+    segments_to_extracted_document,
+    ssh_parakeet_command,
+)
 from filings_library.url_safety import (
     ESEF_ALLOWED_HOSTS,
     HKEX_ALLOWED_HOSTS,
@@ -61,6 +76,8 @@ class SyncConfig:
     sec_user_agent: str | None = None
     download_timeout: float = 60.0
     max_download_bytes: int = MAX_EXTRACT_BYTES
+    parakeet_ssh_config: str | None = None
+    max_transcriptions_per_sync: int = 5
 
 
 @dataclass
@@ -69,6 +86,8 @@ class SyncResult:
     documents_ingested: int = 0
     documents_skipped_existing: int = 0
     documents_skipped_quota: int = 0
+    transcriptions_queued: int = 0
+    transcriptions_completed: int = 0
     facts_updated: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -154,6 +173,149 @@ async def _download_bytes(
     raise ValueError(f"Exceeded max redirects ({max_redirects}) for {url}")
 
 
+async def _drain_audio_transcriptions(
+    *,
+    store: FilingsStore,
+    cas: ContentAddressedStore,
+    cfg: SyncConfig,
+    result: SyncResult,
+    download_transport: httpx.AsyncBaseTransport | None,
+    url_resolver: HostResolver | None,
+    transcriber: Callable[[bytes, str], Awaitable[tuple[bytes, ExtractedDocument]]] | None,
+) -> None:
+    ssh_cfg = (
+        cfg.parakeet_ssh_config or os.environ.get("FILINGS_PARAKEET_WORKER_SSH_CONFIG", "").strip()
+    )
+    if transcriber is None and not ssh_cfg:
+        return
+
+    processed = 0
+    while processed < cfg.max_transcriptions_per_sync:
+        job = store.lease_job("filings-worker-asr", lease_seconds=1800)
+        if job is None:
+            break
+        if job["kind"] != "audio_transcribe":
+            # Re-queue non-ASR jobs for their dedicated handler without burning attempts
+            store.conn.execute(
+                "UPDATE jobs SET status='pending', attempts=MAX(0, attempts-1), lease_owner=NULL, lease_expires_at=NULL WHERE id=?",
+                (job["id"],),
+            )
+            break
+        processed += 1
+        payload = job["payload"]
+        source_key = str(payload["source_key"])
+        external_id = str(payload["external_id"])
+        source_url = str(payload["source_url"])
+        title = str(payload.get("title") or "Earnings Call Transcript")
+        filing_date = str(payload.get("filing_date") or "undated")
+        period_end = payload.get("period_end")
+        try:
+            if store.has_official_transcript(
+                source_key=source_key, period_end=period_end, filing_date=filing_date
+            ):
+                store.complete_job(job["id"])
+                continue
+            raw_bytes, fetched_mime = await _download_bytes(
+                source_url,
+                sec_user_agent=cfg.sec_user_agent,
+                transport=download_transport,
+                timeout=max(cfg.download_timeout, 180.0),
+                max_bytes=cfg.max_download_bytes,
+                allowed_hosts=None,
+                resolver=url_resolver,
+            )
+            audio_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            if transcriber is not None:
+                asr_json_bytes, extracted = await transcriber(
+                    raw_bytes, _filename_from_url(source_url)
+                )
+            else:
+                scratch_root = Path(os.environ.get("TMPDIR", "/scratch"))
+                scratch_dir = scratch_root if scratch_root.exists() else Path(tempfile.gettempdir())
+                with tempfile.TemporaryDirectory(prefix="filings-asr-", dir=scratch_dir) as tmpdir:
+                    tdir = Path(tmpdir)
+                    raw_path = tdir / (_filename_from_url(source_url) or "audio.bin")
+                    wav_path = tdir / "audio.wav"
+                    out_json = tdir / "segments.json"
+                    raw_path.write_bytes(raw_bytes)
+                    await normalize_audio_to_wav(raw_path, wav_path)
+                    prov = await run_remote_parakeet(
+                        wav_path, out_json, command=ssh_parakeet_command(ssh_cfg)
+                    )
+                    asr_json_bytes = out_json.read_bytes()
+                    segments = parse_parakeet_segments(asr_json_bytes)
+                    extracted = segments_to_extracted_document(
+                        segments,
+                        converter_version=f"{prov.engine_version}+{prov.model_sha256[:12]}",
+                    )
+
+            md_bytes = extracted.markdown.encode("utf-8")
+            quota = store.check_quota(
+                len(asr_json_bytes) + len(md_bytes),
+                source_key=source_key,
+                global_cap_bytes=cfg.global_cap_bytes,
+                per_issuer_cap_bytes=cfg.per_issuer_cap_bytes,
+                cas_bytes=cas.total_bytes(),
+            )
+            if not quota.allowed:
+                store.fail_job(job["id"], quota.reason or "quota_exceeded")
+                result.documents_skipped_quota += 1
+                continue
+
+            # Discard raw audio; persist immutable raw ASR JSON + Markdown in CAS
+            asr_sha256 = cas.put_bytes(asr_json_bytes)
+            md_sha256 = cas.put_bytes(md_bytes)
+            doc_id = _make_document_id(source_key, str(SourceAdapter.EARNINGS_WATCH), external_id)
+            doc_record = DocumentRecord(
+                document_id=doc_id,
+                source_key=source_key,
+                adapter=SourceAdapter.EARNINGS_WATCH,
+                external_id=external_id,
+                form_type=ASR_FORM_TYPE,
+                form_family=FormFamily.TRANSCRIPT,
+                title=title,
+                filing_date=filing_date,
+                period_end=period_end,
+                language="en",
+                source_url=source_url,
+                source_sha256=audio_sha256,
+                source_mime=fetched_mime or "audio/mpeg",
+                source_bytes=len(raw_bytes),
+                refetchable=False,
+                is_amendment=False,
+                supersedes_document_id=None,
+                converter_id=extracted.converter_id,
+                converter_version=extracted.converter_version,
+                markdown_sha256=md_sha256,
+                page_count=None,
+            )
+            with store.transaction():
+                store.put_artifact(
+                    source_sha256=audio_sha256,
+                    kind=ArtifactKind.ASR_JSON,
+                    converter_id=extracted.converter_id,
+                    converter_version=extracted.converter_version,
+                    artifact_sha256=asr_sha256,
+                    byte_size=len(asr_json_bytes),
+                )
+                store.put_artifact(
+                    source_sha256=audio_sha256,
+                    kind=ArtifactKind.MARKDOWN,
+                    converter_id=extracted.converter_id,
+                    converter_version=extracted.converter_version,
+                    artifact_sha256=md_sha256,
+                    byte_size=len(md_bytes),
+                )
+                store.upsert_document(doc_record)
+                store.replace_sections(doc_id, extracted.sections)
+            store.complete_job(job["id"])
+            result.transcriptions_completed += 1
+            result.documents_ingested += 1
+        except Exception as exc:
+            store.fail_job(job["id"], str(exc))
+            result.errors.append(f"transcribe {external_id}: {exc}")
+
+
 async def sync_once(
     *,
     store: FilingsStore,
@@ -168,6 +330,7 @@ async def sync_once(
     issuer_ir_adapter: IssuerIrAdapter | None = None,
     download_transport: httpx.AsyncBaseTransport | None = None,
     url_resolver: HostResolver | None = None,
+    transcriber: Callable[[bytes, str], Awaitable[tuple[bytes, ExtractedDocument]]] | None = None,
     today: date | None = None,
 ) -> SyncResult:
     """Run one bounded sync pass across all companies returned by `targets_client`."""
@@ -195,10 +358,7 @@ async def sync_once(
         transport=download_transport,
         resolver=url_resolver,
     )
-    issuer_ir = issuer_ir_adapter or IssuerIrAdapter(
-        transport=download_transport,
-        resolver=url_resolver,
-    )
+    issuer_ir = issuer_ir_adapter
 
     sec_ua = sec.user_agent if sec is not None else cfg.sec_user_agent
 
@@ -207,14 +367,14 @@ async def sync_once(
         result.companies_synced += 1
 
         candidates: list[FilingCandidate] = []
-        # Priority order: release-day fast path first, then Tier 1/2 official adapters,
-        # then deterministic IR link harvesting.
+        # Priority order: Earnings Watch hub (verified_documents + ir_assets),
+        # then official regulatory registries (SEC, HKEX, ESEF).
         adapter_list: list[tuple[str, object]] = [("earnings_watch", ew)]
         if sec is not None:
             adapter_list.append(("sec_edgar", sec))
         adapter_list.append(("hkexnews", hkex))
         adapter_list.append(("esef_xbrl", esef))
-        if company.ir_urls:
+        if issuer_ir is not None and company.ir_urls:
             adapter_list.append(("issuer_ir", issuer_ir))
 
         for adapter_name, adapter in adapter_list:
@@ -243,6 +403,82 @@ async def sync_once(
 
             if store.count_documents_for_issuer(company.source_key) >= cfg.per_issuer_max_docs:
                 result.documents_skipped_quota += 1
+                continue
+
+            if cand.form_type == "earnings_call_audio_replay":
+                if store.has_official_transcript(
+                    source_key=company.source_key,
+                    period_end=cand.period_end,
+                    filing_date=cand.filing_date,
+                ):
+                    result.documents_skipped_existing += 1
+                    continue
+                queued_id = store.enqueue_job_if_absent(
+                    "audio_transcribe",
+                    {
+                        "source_key": cand.source_key,
+                        "external_id": cand.external_id,
+                        "source_url": cand.source_url,
+                        "title": cand.title,
+                        "filing_date": cand.filing_date,
+                        "period_end": cand.period_end,
+                    },
+                )
+                if queued_id is not None:
+                    result.transcriptions_queued += 1
+                continue
+
+            if cand.form_type == "webcast_replay":
+                doc_id = _make_document_id(cand.source_key, str(cand.adapter), cand.external_id)
+                md_text = f"## {cand.title}\n\nOfficial webcast replay: [{cand.source_url}]({cand.source_url})\n"
+                md_bytes = md_text.encode("utf-8")
+                md_sha256 = cas.put_bytes(md_bytes)
+                link_sha256 = hashlib.sha256(cand.source_url.encode("utf-8")).hexdigest()
+                webcast_doc = DocumentRecord(
+                    document_id=doc_id,
+                    source_key=cand.source_key,
+                    adapter=cand.adapter,
+                    external_id=cand.external_id,
+                    form_type=cand.form_type,
+                    form_family=FormFamily.WEBCAST,
+                    title=cand.title,
+                    filing_date=cand.filing_date,
+                    period_end=cand.period_end,
+                    language=cand.language,
+                    source_url=cand.source_url,
+                    source_sha256=link_sha256,
+                    source_mime="text/html",
+                    source_bytes=len(md_bytes),
+                    refetchable=False,
+                    is_amendment=False,
+                    converter_id="webcast-bookmark",
+                    converter_version="1.0.0",
+                    markdown_sha256=md_sha256,
+                    page_count=None,
+                )
+                with store.transaction():
+                    store.put_artifact(
+                        source_sha256=link_sha256,
+                        kind=ArtifactKind.MARKDOWN,
+                        converter_id="webcast-bookmark",
+                        converter_version="1.0.0",
+                        artifact_sha256=md_sha256,
+                        byte_size=len(md_bytes),
+                    )
+                    store.upsert_document(webcast_doc)
+                    store.replace_sections(
+                        doc_id,
+                        [
+                            ExtractedSection(
+                                locator="section:webcast",
+                                title=cand.title,
+                                ordinal=0,
+                                markdown=md_text,
+                                ocr_used=False,
+                            )
+                        ],
+                    )
+                result.documents_ingested += 1
                 continue
 
             try:
@@ -307,6 +543,12 @@ async def sync_once(
                     base_form_type=cand.base_form_type,
                     period_end=cand.period_end,
                     before_filing_date=cand.filing_date,
+                )
+            elif cand.form_family == FormFamily.TRANSCRIPT and cand.form_type != ASR_FORM_TYPE:
+                supersedes_id = store.find_asr_transcript_to_supersede(
+                    source_key=company.source_key,
+                    period_end=cand.period_end,
+                    filing_date=cand.filing_date,
                 )
 
             doc_id = _make_document_id(cand.source_key, str(cand.adapter), cand.external_id)
@@ -378,6 +620,16 @@ async def sync_once(
                     result.documents_skipped_quota += 1
             except Exception as exc:
                 result.errors.append(f"{company.source_key}/companyfacts: {exc}")
+
+    await _drain_audio_transcriptions(
+        store=store,
+        cas=cas,
+        cfg=cfg,
+        result=result,
+        download_transport=download_transport,
+        url_resolver=url_resolver,
+        transcriber=transcriber,
+    )
 
     return result
 

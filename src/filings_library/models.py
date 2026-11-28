@@ -21,6 +21,7 @@ class FormFamily(StrEnum):
     PRESENTATION = "presentation"
     TRANSCRIPT = "transcript"
     DATABOOK = "databook"
+    WEBCAST = "webcast"
     OTHER = "other"
 
 
@@ -29,6 +30,7 @@ class ArtifactKind(StrEnum):
     OCR_PDF = "ocr_pdf"
     MARKDOWN = "markdown"
     FACTS_JSON = "facts_json"
+    ASR_JSON = "asr_json"
 
 
 class SourceAdapter(StrEnum):
@@ -42,11 +44,14 @@ class SourceAdapter(StrEnum):
 class VerifiedDocumentHint(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str
-    event_id: str
+    event_id: str = ""
     url: str
     title: str = ""
     role: str = "other"
     category: str = ""
+    published_date: str | None = None
+    period: str | None = None
+    evidence_url: str = ""
     first_seen: str = ""
 
 
@@ -64,6 +69,7 @@ class CompanyTarget(BaseModel):
     period_scheme: str = "calendar-q"
     ir_urls: list[str] = Field(default_factory=list)
     verified_documents: list[VerifiedDocumentHint] = Field(default_factory=list)
+    ir_assets: list[VerifiedDocumentHint] = Field(default_factory=list)
 
     @field_validator("ir_urls", mode="before")
     @classmethod

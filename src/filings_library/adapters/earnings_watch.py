@@ -30,6 +30,8 @@ _CATEGORY_TO_FAMILY: dict[DocumentCategory, FormFamily] = {
     DocumentCategory.PROXY: FormFamily.PROXY,
     DocumentCategory.CIRCULAR: FormFamily.CIRCULAR,
     DocumentCategory.OFFERING: FormFamily.OFFERING,
+    DocumentCategory.AUDIO_REPLAY: FormFamily.TRANSCRIPT,
+    DocumentCategory.WEBCAST_PAGE: FormFamily.WEBCAST,
 }
 
 
@@ -37,12 +39,20 @@ def _guess_mime(url: str) -> str:
     lower = url.split("?", 1)[0].lower()
     if lower.endswith(".pdf"):
         return "application/pdf"
+    if lower.endswith(".pptx"):
+        return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     if lower.endswith(".xlsx"):
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if lower.endswith((".htm", ".html")):
         return "text/html"
     if lower.endswith(".xhtml"):
         return "application/xhtml+xml"
+    if lower.endswith(".mp3"):
+        return "audio/mpeg"
+    if lower.endswith(".m4a"):
+        return "audio/mp4"
+    if lower.endswith(".mp4"):
+        return "video/mp4"
     return ""
 
 
@@ -69,7 +79,8 @@ class EarningsWatchAdapter:
     ) -> list[FilingCandidate]:
         del today
         candidates: list[FilingCandidate] = []
-        for hint in company.verified_documents:
+        seen_urls: set[str] = set()
+        for hint in [*company.verified_documents, *company.ir_assets]:
             raw_url = hint.url.strip()
             if not raw_url:
                 continue
@@ -77,19 +88,28 @@ class EarningsWatchAdapter:
                 safe_url = validate_public_https_url(raw_url, resolver=self._resolver)
             except UnsafeUrlError:
                 continue
+            if safe_url in seen_urls:
+                continue
+            seen_urls.add(safe_url)
             category = normalize_document_category(hint.category or hint.role or "other")
             form_family = _CATEGORY_TO_FAMILY.get(category, FormFamily.RESULTS_RELEASE)
-            fdate = _parse_iso_date(hint.first_seen)
+            fdate = _parse_iso_date(hint.published_date or hint.first_seen)
+            if category == DocumentCategory.AUDIO_REPLAY:
+                form_type = "earnings_call_audio_replay"
+            elif category == DocumentCategory.WEBCAST_PAGE:
+                form_type = "webcast_replay"
+            else:
+                form_type = hint.role or category.value or "results_release"
             candidates.append(
                 FilingCandidate(
                     source_key=company.source_key,
                     adapter=SourceAdapter.EARNINGS_WATCH,
                     external_id=hint.id,
-                    form_type=hint.role or "results_release",
+                    form_type=form_type,
                     form_family=form_family,
-                    title=hint.title or f"{company.name} {hint.role}",
+                    title=hint.title or f"{company.name} {form_type}",
                     filing_date=fdate,
-                    period_end=None,
+                    period_end=hint.period,
                     source_url=safe_url,
                     source_mime=_guess_mime(safe_url),
                     language="en",

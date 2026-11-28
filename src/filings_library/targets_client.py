@@ -97,7 +97,11 @@ class LibraryTargetsClient:
                 transport=self._transport,
                 timeout=self._timeout,
             ) as client:
-                resp = await client.get("/internal/library-targets", headers=headers)
+                resp = await client.get(
+                    "/internal/library-targets",
+                    params={"schema": "2"},
+                    headers=headers,
+                )
         except httpx.HTTPError as exc:
             raise HubUnavailableError(f"Targets hub request failed: {exc}") from exc
 

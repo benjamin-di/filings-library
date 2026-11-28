@@ -10,6 +10,8 @@ RUN apt-get update \
         poppler-utils \
         tesseract-ocr \
         qpdf \
+        ffmpeg \
+        openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir "uv==0.13.8"
 

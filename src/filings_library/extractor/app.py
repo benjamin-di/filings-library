@@ -15,6 +15,7 @@ from starlette.routing import Route
 
 from filings_library.extractor.html_ixbrl import extract_html_ixbrl
 from filings_library.extractor.pdf_extract import EncryptedPdfError, extract_pdf
+from filings_library.extractor.pptx_extract import extract_pptx
 from filings_library.extractor.xlsx_extract import extract_xlsx
 from filings_library.models import ExtractedDocument
 
@@ -35,6 +36,11 @@ def _detect_kind(mime_type: str, filename: str) -> str | None:
         or fname.endswith(".xlsx")
     ):
         return "xlsx"
+    if (
+        mime == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        or fname.endswith(".pptx")
+    ):
+        return "pptx"
     return None
 
 
@@ -98,6 +104,8 @@ async def _extract(request: Request) -> JSONResponse:
             extracted = await asyncio.to_thread(extract_html_ixbrl, body)
         elif kind == "pdf":
             extracted = await asyncio.to_thread(extract_pdf, body)
+        elif kind == "pptx":
+            extracted = await asyncio.to_thread(extract_pptx, body)
         else:
             extracted = await asyncio.to_thread(extract_xlsx, body)
     except EncryptedPdfError as exc:

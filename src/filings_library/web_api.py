@@ -171,8 +171,18 @@ def build_viewer_url(
 
 
 def format_display_form_type(form_type: str, adapter: str = "") -> str:
-    """Clean raw HTML-entity-encoded HKEX categories into crisp UI badges."""
-    cleaned = _WS_RE.sub(" ", _HTML_TAG_RE.sub(" ", html.unescape(form_type or ""))).strip()
+    """Clean raw HTML-entity-encoded HKEX categories and IR/ASR types into crisp UI badges."""
+    raw = (form_type or "").strip()
+    lower = raw.lower()
+    if lower == "earnings_call_transcript_asr":
+        return "Self-Transcribed (ASR)"
+    if lower in {"transcript", "prepared_remarks", "call_transcript", "q4-transcript"}:
+        return "Official Transcript"
+    if lower in {"presentation", "slides", "deck", "q4-pres"}:
+        return "Presentation"
+    if lower in {"webcast_replay", "webcast_page", "q4-webcast"}:
+        return "Webcast"
+    cleaned = _WS_RE.sub(" ", _HTML_TAG_RE.sub(" ", html.unescape(raw))).strip()
     if not cleaned:
         return "Filing"
     if adapter == "hkexnews" or len(cleaned) > 36:
@@ -186,6 +196,14 @@ def format_display_form_type(form_type: str, adapter: str = "") -> str:
         if len(cleaned) > 32:
             return cleaned[:29].rstrip() + "..."
     return cleaned
+
+
+def transcript_origin_for(form_type: str, form_family: str) -> str | None:
+    if (form_type or "").strip().lower() == "earnings_call_transcript_asr":
+        return "asr"
+    if str(form_family) == "transcript":
+        return "official"
+    return None
 
 
 @dataclass(frozen=True)
@@ -626,6 +644,9 @@ def build_web_routes(
             item["display_form_type"] = format_display_form_type(
                 str(d.get("form_type") or ""), str(d.get("adapter") or "")
             )
+            item["transcript_origin"] = transcript_origin_for(
+                str(d.get("form_type") or ""), str(d.get("form_family") or "")
+            )
             item["viewer_url"] = build_viewer_url(public_base_url, str(d["document_id"]))
             enriched.append(item)
         return _json({"documents": enriched, "count": len(enriched)})
@@ -707,6 +728,9 @@ def build_web_routes(
                         **doc.model_dump(),
                         "display_form_type": format_display_form_type(
                             doc.form_type, str(doc.adapter)
+                        ),
+                        "transcript_origin": transcript_origin_for(
+                            doc.form_type, str(doc.form_family)
                         ),
                         "ticker": company.ticker if company else "",
                         "company_name": company.name if company else doc.source_key,

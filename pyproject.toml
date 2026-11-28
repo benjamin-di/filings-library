@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "filings-library"
-version = "0.4.2"
+version = "0.5.0"
 description = "Multi-user company financial filings library: immutable archive, OCR, Markdown, FTS5 search, XBRL facts, and MCP server"
 requires-python = ">=3.12"
 license = "MIT"
@@ -21,13 +21,14 @@ dependencies = [
     "starlette>=1.0,<2",
     "uvicorn>=0.30,<1",
     "signin-window[oidc]==0.15.0",
-    "issuer-sources @ https://github.com/benjamin-di/issuer-sources/archive/refs/tags/v0.1.0.tar.gz",
+    "issuer-sources @ https://github.com/benjamin-di/issuer-sources/archive/refs/tags/v0.2.0.tar.gz",
 ]
 
 [project.optional-dependencies]
 extractor = [
     "pypdfium2>=4.30,<6",
     "pillow>=11,<13",
+    "python-pptx>=1.0,<2",
 ]
 
 [project.scripts]

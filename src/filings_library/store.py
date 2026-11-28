@@ -492,6 +492,82 @@ class FilingsStore:
         ).fetchone()
         return int(row["cnt"]) if row else 0
 
+    def has_official_transcript(
+        self,
+        *,
+        source_key: str,
+        period_end: str | None = None,
+        filing_date: str | None = None,
+    ) -> bool:
+        """Return True if an official (non-ASR) transcript exists for this issuer/period."""
+        if period_end:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM documents
+                WHERE source_key = ?
+                  AND form_family = 'transcript'
+                  AND form_type != 'earnings_call_transcript_asr'
+                  AND period_end = ?
+                LIMIT 1
+                """,
+                (source_key, period_end),
+            ).fetchone()
+            if row is not None:
+                return True
+        if filing_date and filing_date != "undated":
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM documents
+                WHERE source_key = ?
+                  AND form_family = 'transcript'
+                  AND form_type != 'earnings_call_transcript_asr'
+                  AND filing_date = ?
+                LIMIT 1
+                """,
+                (source_key, filing_date),
+            ).fetchone()
+            return row is not None
+        return False
+
+    def find_asr_transcript_to_supersede(
+        self,
+        *,
+        source_key: str,
+        period_end: str | None = None,
+        filing_date: str | None = None,
+    ) -> str | None:
+        """Find a self-transcribed ASR transcript superseded by an official transcript."""
+        if period_end:
+            row = self._conn.execute(
+                """
+                SELECT document_id FROM documents
+                WHERE source_key = ?
+                  AND form_family = 'transcript'
+                  AND form_type = 'earnings_call_transcript_asr'
+                  AND period_end = ?
+                ORDER BY filing_date DESC
+                LIMIT 1
+                """,
+                (source_key, period_end),
+            ).fetchone()
+            if row is not None:
+                return str(row["document_id"])
+        if filing_date and filing_date != "undated":
+            row = self._conn.execute(
+                """
+                SELECT document_id FROM documents
+                WHERE source_key = ?
+                  AND form_family = 'transcript'
+                  AND form_type = 'earnings_call_transcript_asr'
+                  AND filing_date = ?
+                ORDER BY filing_date DESC
+                LIMIT 1
+                """,
+                (source_key, filing_date),
+            ).fetchone()
+            return str(row["document_id"]) if row is not None else None
+        return None
+
     @staticmethod
     def _row_to_document(row: sqlite3.Row) -> DocumentRecord:
         return DocumentRecord(

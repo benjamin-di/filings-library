@@ -453,7 +453,7 @@ async def test_end_to_end_sync_once_and_export_markdown(tmp_path: Path) -> None:
 
     def _web_handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if url.endswith("/internal/library-targets"):
+        if request.url.path == "/internal/library-targets":
             return httpx.Response(200, json=targets_payload)
         if "submissions/CIK0000123456.json" in url:
             return httpx.Response(200, json=sec_submissions)
@@ -847,7 +847,7 @@ async def test_sync_once_honors_fetched_mime_and_isolates_persist_errors(
 
     def _handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if url.endswith("/internal/library-targets"):
+        if request.url.path == "/internal/library-targets":
             return httpx.Response(200, json=targets_payload)
         if "download?id=42" in url:
             return httpx.Response(
