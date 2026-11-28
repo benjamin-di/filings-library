@@ -27,24 +27,43 @@ MAX_SEARCH_PAGES = 20
 
 # Strictly rejected HKEX categories (noise).
 _REJECTED_T1_CODES = frozenset({"19000"})  # Overseas Regulatory Announcements
-_REJECTED_T2_CODES = frozenset(
+_HARD_REJECTED_T2_CODES = frozenset(
     {
         "13100",  # Date of Board Meeting
         "16300",  # Next Day Disclosure Returns
         "16400",  # Monthly Returns
-        "19100",  # Overseas Regulatory Announcement
     }
 )
-_REJECTED_TITLE_SUBSTRINGS = (
+_OVERSEAS_T2_CODES = frozenset({"19100"})
+_HARD_REJECTED_TITLE_SUBSTRINGS = (
     "monthly return",
     "next day disclosure return",
     "date of board meeting",
     "board meeting",
-    "overseas regulatory announcement",
     "poll results of",
     "form of proxy",
     "notification letter",
 )
+_OVERSEAS_SUBSTRING = "overseas regulatory announcement"
+_RESULTS_MARKERS = (
+    "final results",
+    "annual results",
+    "interim results",
+    "quarterly results",
+    "results announcement",
+)
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def clean_hkex_text(raw: str) -> str:
+    """Strip HTML tags (`<br/>`, `<div>`, etc.) and unescape HTML entities."""
+    with_sep = _BR_TAG_RE.sub(" / ", raw or "")
+    no_tags = _HTML_TAG_RE.sub(" ", with_sep)
+    unescaped = html.unescape(no_tags)
+    collapsed = re.sub(r"\s+", " ", unescaped).strip()
+    return re.sub(r"(?:\s*/\s*){2,}", " / ", collapsed).strip(" /")
+
 
 # Kept HKEX categories mapped to FormFamily.
 _FINANCIAL_STATEMENTS_T1 = "40000"
@@ -73,17 +92,20 @@ def is_kept_hkex_filing(
     """Return `(kept, form_family)` enforcing strict HKEX noise rejection."""
     t1 = str(t1code or "").strip()
     t2 = str(t2code or "").strip()
-    lower_title = html.unescape(title or "").strip().lower()
-    lower_long = html.unescape(long_text or "").strip().lower()
+    lower_title = clean_hkex_text(title or "").lower()
+    lower_long = clean_hkex_text(long_text or "").lower()
     combined = f"{lower_long} {lower_title}"
 
-    if t1 in _REJECTED_T1_CODES or t2 in _REJECTED_T2_CODES:
+    # 1. Hard-reject non-financial administrative noise first.
+    if t2 in _HARD_REJECTED_T2_CODES:
         return False, FormFamily.OTHER
-    if any(noise in combined for noise in _REJECTED_TITLE_SUBSTRINGS):
+    if any(noise in combined for noise in _HARD_REJECTED_TITLE_SUBSTRINGS):
         return False, FormFamily.OTHER
     if "monthly returns" in lower_long or "next day disclosure" in lower_long:
         return False, FormFamily.OTHER
 
+    # 2. Check explicit financial statements and results categories BEFORE rejecting
+    #    "overseas regulatory announcement" so multi-tag A+H results filings are kept.
     if t2 in _FINANCIAL_STATEMENTS_T2:
         return True, _FINANCIAL_STATEMENTS_T2[t2]
     if t1 == _FINANCIAL_STATEMENTS_T1:
@@ -96,14 +118,6 @@ def is_kept_hkex_filing(
     if t2 in _RESULTS_T2:
         return True, _RESULTS_T2[t2]
 
-    if t1 == _CIRCULAR_T1 or t2.startswith("50"):
-        return True, FormFamily.CIRCULAR
-
-    if t1 in _OFFERING_T1 or t2 in _OFFERING_T2:
-        return True, FormFamily.OFFERING
-
-    # Live HKEXnews titleSearchServlet.do returns category labels in LONG_TEXT/SHORT_TEXT
-    # rather than numeric T1_CODE/T2_CODE fields.
     if lower_long:
         if "financial statements" in lower_long or "esg information" in lower_long:
             if "interim" in lower_long or "half-year" in lower_long or "interim" in lower_title:
@@ -111,17 +125,22 @@ def is_kept_hkex_filing(
             if "quarter" in lower_long or "quarter" in lower_title:
                 return True, FormFamily.QUARTERLY_REPORT
             return True, FormFamily.ANNUAL_REPORT
-        if any(
-            marker in lower_long
-            for marker in (
-                "final results",
-                "annual results",
-                "interim results",
-                "quarterly results",
-                "results announcement",
-            )
-        ):
+        if any(marker in lower_long for marker in _RESULTS_MARKERS):
             return True, FormFamily.RESULTS_RELEASE
+
+    # 3. Reject pure Overseas Regulatory Announcements that carry no results/financial tag.
+    if t1 in _REJECTED_T1_CODES or t2 in _OVERSEAS_T2_CODES:
+        return False, FormFamily.OTHER
+    if _OVERSEAS_SUBSTRING in combined:
+        return False, FormFamily.OTHER
+
+    if t1 == _CIRCULAR_T1 or t2.startswith("50"):
+        return True, FormFamily.CIRCULAR
+
+    if t1 in _OFFERING_T1 or t2 in _OFFERING_T2:
+        return True, FormFamily.OFFERING
+
+    if lower_long:
         if lower_long.startswith("circulars"):
             return True, FormFamily.CIRCULAR
         if "listing documents" in lower_long or "prospectus" in lower_long:
@@ -317,7 +336,7 @@ class HkexnewsAdapter:
                 continue
 
             news_id = str(rec.get("NEWS_ID") or rec.get("news_id") or file_link).strip()
-            form_type = str(rec.get("SHORT_TEXT") or form_family.value).strip()
+            form_type = clean_hkex_text(str(rec.get("SHORT_TEXT") or "")) or form_family.value
 
             candidates.append(
                 FilingCandidate(

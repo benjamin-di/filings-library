@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from urllib.parse import urlparse
 
 from issuer_sources.model import DocumentCategory, normalize_document_category
 
@@ -16,6 +17,23 @@ from filings_library.url_safety import (
 )
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DIRECT_AUDIO_EXTENSIONS = (".mp3", ".m4a", ".wav", ".ogg", ".opus")
+_WEBCAST_ONLY_HOSTS = frozenset(
+    {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "vimeo.com", "player.vimeo.com"}
+)
+
+
+def is_direct_audio_url(url: str) -> bool:
+    """Return True only for direct downloadable audio files (never YouTube/Vimeo/HLS)."""
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host in _WEBCAST_ONLY_HOSTS or host.endswith(".youtube.com") or host.endswith(".vimeo.com"):
+        return False
+    path = parsed.path.lower()
+    if path.endswith(".m3u8"):
+        return False
+    return path.endswith(DIRECT_AUDIO_EXTENSIONS)
+
 
 _CATEGORY_TO_FAMILY: dict[DocumentCategory, FormFamily] = {
     DocumentCategory.RESULTS_RELEASE: FormFamily.RESULTS_RELEASE,
@@ -51,6 +69,12 @@ def _guess_mime(url: str) -> str:
         return "audio/mpeg"
     if lower.endswith(".m4a"):
         return "audio/mp4"
+    if lower.endswith(".wav"):
+        return "audio/wav"
+    if lower.endswith(".ogg"):
+        return "audio/ogg"
+    if lower.endswith(".opus"):
+        return "audio/opus"
     if lower.endswith(".mp4"):
         return "video/mp4"
     return ""
@@ -80,7 +104,11 @@ class EarningsWatchAdapter:
         del today
         candidates: list[FilingCandidate] = []
         seen_urls: set[str] = set()
-        for hint in [*company.verified_documents, *company.ir_assets]:
+        hint_sources = [
+            *((hint, True) for hint in company.verified_documents),
+            *((hint, False) for hint in company.ir_assets),
+        ]
+        for hint, allow_first_seen_fallback in hint_sources:
             raw_url = hint.url.strip()
             if not raw_url:
                 continue
@@ -93,11 +121,22 @@ class EarningsWatchAdapter:
             seen_urls.add(safe_url)
             category = normalize_document_category(hint.category or hint.role or "other")
             form_family = _CATEGORY_TO_FAMILY.get(category, FormFamily.RESULTS_RELEASE)
-            fdate = _parse_iso_date(hint.published_date or hint.first_seen)
+            if hint.published_date:
+                fdate = _parse_iso_date(hint.published_date)
+            elif allow_first_seen_fallback:
+                fdate = _parse_iso_date(hint.first_seen)
+            else:
+                fdate = "undated"
             if category == DocumentCategory.AUDIO_REPLAY:
-                form_type = "earnings_call_audio_replay"
+                if is_direct_audio_url(safe_url):
+                    form_type = "earnings_call_audio_replay"
+                    form_family = FormFamily.TRANSCRIPT
+                else:
+                    form_type = "webcast_replay"
+                    form_family = FormFamily.WEBCAST
             elif category == DocumentCategory.WEBCAST_PAGE:
                 form_type = "webcast_replay"
+                form_family = FormFamily.WEBCAST
             else:
                 form_type = hint.role or category.value or "results_release"
             candidates.append(

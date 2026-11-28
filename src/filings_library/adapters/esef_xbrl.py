@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
+from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -17,6 +20,67 @@ from filings_library.url_safety import (
 
 ESEF_API_BASE = "https://filings.xbrl.org"
 ESEF_FILINGS_URL = f"{ESEF_API_BASE}/api/filings"
+
+_KNOWN_ESEF_LANGUAGES = frozenset(
+    {
+        "en",
+        "de",
+        "it",
+        "fr",
+        "pt",
+        "es",
+        "nl",
+        "sv",
+        "da",
+        "fi",
+        "no",
+        "nb",
+        "pl",
+        "cs",
+        "hu",
+        "ro",
+        "el",
+        "bg",
+        "hr",
+        "sk",
+        "sl",
+        "et",
+        "lv",
+        "lt",
+    }
+)
+_URL_LANG_SUFFIX_RE = re.compile(r"[-_]([a-z]{2})(?:[-_][a-z]{2})?\.(?:x?html?)$", re.IGNORECASE)
+_URL_LANG_SEGMENT_RE = re.compile(r"/([a-z]{2})/", re.IGNORECASE)
+_FXO_REV_RE = re.compile(r"/(\d+)$")
+
+
+def _detect_esef_language(report_url: str, attrs: dict[str, Any]) -> str:
+    """Detect ISO-639-1 language from ESEF attributes or report URL/filename."""
+    for key in ("language", "lang"):
+        raw = str(attrs.get(key) or "").strip().lower()
+        if raw:
+            code = raw.split("-", 1)[0].split("_", 1)[0]
+            if code in _KNOWN_ESEF_LANGUAGES:
+                return code
+
+    path = urlparse(report_url).path
+    suffix_match = _URL_LANG_SUFFIX_RE.search(path)
+    if suffix_match:
+        code = suffix_match.group(1).lower()
+        if code in _KNOWN_ESEF_LANGUAGES:
+            return code
+
+    for seg_match in _URL_LANG_SEGMENT_RE.finditer(path):
+        code = seg_match.group(1).lower()
+        if code in _KNOWN_ESEF_LANGUAGES:
+            return code
+
+    return "en"
+
+
+def _parse_esef_revision(external_id: str) -> int:
+    match = _FXO_REV_RE.search(external_id or "")
+    return int(match.group(1)) if match else -1
 
 
 def _resolve_url(raw: str) -> str:
@@ -73,7 +137,7 @@ class EsefXbrlAdapter:
         if not isinstance(items, list):
             return []
 
-        candidates: list[FilingCandidate] = []
+        best_by_key: dict[tuple[str, str], tuple[tuple[str, int, str], FilingCandidate]] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -89,17 +153,18 @@ class EsefXbrlAdapter:
                 continue
 
             period_end = _extract_iso_date(attrs.get("period_end")) or None
-            filing_date = (
-                _extract_iso_date(attrs.get("date_added"))
-                or _extract_iso_date(attrs.get("processed"))
-                or period_end
-                or ""
+            raw_timestamp = (
+                str(attrs.get("date_added") or "").strip()
+                or str(attrs.get("processed") or "").strip()
+                or (period_end or "")
             )
+            filing_date = _extract_iso_date(raw_timestamp)
             if not filing_date or filing_date < cutoff:
                 continue
 
             external_id = str(attrs.get("fxo_id") or item.get("id") or report_url).strip()
             country = str(attrs.get("country") or "").strip().upper()
+            language = _detect_esef_language(report_url, attrs)
             title = f"{company.name} ESEF Annual Report"
             if period_end:
                 title = f"{title} ({period_end})"
@@ -115,24 +180,27 @@ class EsefXbrlAdapter:
             except UnsafeUrlError:
                 continue
 
-            candidates.append(
-                FilingCandidate(
-                    source_key=company.source_key,
-                    adapter=SourceAdapter.ESEF_XBRL,
-                    external_id=external_id,
-                    form_type="ESEF-AR",
-                    form_family=FormFamily.ANNUAL_REPORT,
-                    title=title,
-                    filing_date=filing_date,
-                    period_end=period_end,
-                    source_url=resolved_url,
-                    source_mime="application/xhtml+xml"
-                    if lower_url.endswith(".xhtml")
-                    else "text/html",
-                    language="en",
-                    refetchable=True,
-                    is_amendment=False,
-                )
+            candidate = FilingCandidate(
+                source_key=company.source_key,
+                adapter=SourceAdapter.ESEF_XBRL,
+                external_id=external_id,
+                form_type="ESEF-AR",
+                form_family=FormFamily.ANNUAL_REPORT,
+                title=title,
+                filing_date=filing_date,
+                period_end=period_end,
+                source_url=resolved_url,
+                source_mime="application/xhtml+xml"
+                if lower_url.endswith(".xhtml")
+                else "text/html",
+                language=language,
+                refetchable=True,
+                is_amendment=False,
             )
+            dedup_key = (period_end or filing_date, language)
+            rank = (raw_timestamp, _parse_esef_revision(external_id), external_id)
+            prev = best_by_key.get(dedup_key)
+            if prev is None or rank > prev[0]:
+                best_by_key[dedup_key] = (rank, candidate)
 
-        return candidates
+        return [pair[1] for pair in best_by_key.values()]

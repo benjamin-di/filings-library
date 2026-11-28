@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from filings_library.models import (
     ArtifactKind,
@@ -31,6 +32,24 @@ _COMMA_NUMBER_RE = re.compile(r"(?<!\d)\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\d)")
 
 def utc_now_iso() -> str:
     return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def canonicalize_source_url(url: str) -> str:
+    """Normalize a source URL for cross-adapter deduplication (lowercase scheme/host, no fragment)."""
+    cleaned = (url or "").strip()
+    if not cleaned:
+        return ""
+    parsed = urlsplit(cleaned)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    port = parsed.port
+    if port is not None and not (
+        (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    ):
+        netloc = f"{host}:{port}"
+    else:
+        netloc = host
+    return urlunsplit((scheme, netloc, parsed.path, parsed.query, ""))
 
 
 def extract_normalized_numbers(text: str) -> str:
@@ -118,6 +137,12 @@ CREATE INDEX IF NOT EXISTS idx_documents_source_key_date
 CREATE INDEX IF NOT EXISTS idx_documents_supersedes
     ON documents(supersedes_document_id);
 
+CREATE INDEX IF NOT EXISTS idx_documents_source_key_sha
+    ON documents(source_key, source_sha256);
+
+CREATE INDEX IF NOT EXISTS idx_documents_source_key_url
+    ON documents(source_key, source_url);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     source_sha256 TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -176,6 +201,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease
     ON jobs(status, lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS sec_index_cache (
+    cik INTEGER NOT NULL,
+    accession_number TEXT NOT NULL,
+    index_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY(cik, accession_number)
+);
 """
 
 
@@ -211,11 +244,63 @@ class FilingsStore:
 
     def _init_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)
+        self._run_migrations()
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
+
+    def _run_migrations(self) -> None:
+        """Run idempotent startup migrations on existing SQLite state."""
+        from filings_library.adapters.sec_edgar import is_routine_6k
+
+        with self._tx():
+            # 1. Purge leftover retired `issuer_ir` rows (documents, sections, FTS)
+            #    and pending `ir_gap_backfill` jobs without touching CAS or other adapters.
+            self._conn.execute(
+                """
+                DELETE FROM fts_chunks
+                WHERE document_id IN (
+                    SELECT document_id FROM documents WHERE adapter = 'issuer_ir'
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                DELETE FROM sections
+                WHERE document_id IN (
+                    SELECT document_id FROM documents WHERE adapter = 'issuer_ir'
+                )
+                """
+            )
+            self._conn.execute("DELETE FROM documents WHERE adapter = 'issuer_ir'")
+            self._conn.execute(
+                "DELETE FROM jobs WHERE kind = 'ir_gap_backfill' AND status = 'pending'"
+            )
+
+            # 2. Reclassify existing routine SEC 6-K noise rows from results_release
+            #    to current_report so they do not pollute or starve financial filings.
+            rows = self._conn.execute(
+                """
+                SELECT document_id, title, source_url FROM documents
+                WHERE adapter = 'sec_edgar'
+                  AND form_type = '6-K'
+                  AND form_family = 'results_release'
+                """
+            ).fetchall()
+            to_reclassify = [
+                (str(r["document_id"]),)
+                for r in rows
+                if is_routine_6k(
+                    str(r["title"] or ""), Path(urlsplit(str(r["source_url"] or "")).path).name
+                )
+            ]
+            if to_reclassify:
+                self._conn.executemany(
+                    "UPDATE documents SET form_family = 'current_report' WHERE document_id = ?",
+                    to_reclassify,
+                )
 
     def schema_version(self) -> int:
         row = self._conn.execute(
@@ -491,6 +576,57 @@ class FilingsStore:
             "SELECT COUNT(*) AS cnt FROM documents WHERE source_key = ?", (source_key,)
         ).fetchone()
         return int(row["cnt"]) if row else 0
+
+    def has_document_by_sha256(self, source_key: str, source_sha256: str) -> bool:
+        """Return True if any adapter already stored `source_sha256` for `source_key`."""
+        row = self._conn.execute(
+            "SELECT 1 FROM documents WHERE source_key = ? AND source_sha256 = ? LIMIT 1",
+            (source_key, source_sha256),
+        ).fetchone()
+        return row is not None
+
+    def has_document_by_url(self, source_key: str, source_url: str) -> bool:
+        """Return True if any adapter already stored canonical `source_url` for `source_key`."""
+        exact = self._conn.execute(
+            "SELECT 1 FROM documents WHERE source_key = ? AND source_url = ? LIMIT 1",
+            (source_key, source_url),
+        ).fetchone()
+        if exact is not None:
+            return True
+        target = canonicalize_source_url(source_url)
+        if not target:
+            return False
+        rows = self._conn.execute(
+            "SELECT source_url FROM documents WHERE source_key = ?",
+            (source_key,),
+        ).fetchall()
+        return any(canonicalize_source_url(str(r["source_url"])) == target for r in rows)
+
+    def get_sec_index_cache(self, cik: int, accession_number: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT index_json FROM sec_index_cache WHERE cik = ? AND accession_number = ?",
+            (int(cik), accession_number),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(str(row["index_json"]))
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    def put_sec_index_cache(
+        self, cik: int, accession_number: str, index_json: dict[str, Any]
+    ) -> None:
+        now = utc_now_iso()
+        with self._tx():
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO sec_index_cache(cik, accession_number, index_json, fetched_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(cik), accession_number, json.dumps(index_json, sort_keys=True), now),
+            )
 
     def has_official_transcript(
         self,

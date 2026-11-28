@@ -37,8 +37,8 @@ class SourceAdapter(StrEnum):
     SEC_EDGAR = "sec_edgar"
     HKEXNEWS = "hkexnews"
     ESEF_XBRL = "esef_xbrl"
+    ASX = "asx"
     EARNINGS_WATCH = "earnings_watch"
-    ISSUER_IR = "issuer_ir"
 
 
 class VerifiedDocumentHint(BaseModel):

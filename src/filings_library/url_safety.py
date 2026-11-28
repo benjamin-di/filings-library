@@ -12,6 +12,14 @@ HKEX_ALLOWED_HOSTS: frozenset[str] = frozenset(
     {"www1.hkexnews.hk", "www.hkexnews.hk", "hkexnews.hk"}
 )
 ESEF_ALLOWED_HOSTS: frozenset[str] = frozenset({"filings.xbrl.org"})
+ASX_ALLOWED_HOSTS: frozenset[str] = frozenset(
+    {
+        "asx.api.markitdigital.com",
+        "www.asx.com.au",
+        "announcements.asx.com.au",
+        "cdn-api.markitdigital.com",
+    }
+)
 
 HostResolver = Callable[[str, int], Sequence[str]]
 

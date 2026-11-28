@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from datetime import date, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -17,6 +17,9 @@ from filings_library.url_safety import (
     UnsafeUrlError,
     validate_public_https_url,
 )
+
+if TYPE_CHECKING:
+    from filings_library.store import FilingsStore
 
 SEC_SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
 SEC_SUBMISSIONS_URL = f"{SEC_SUBMISSIONS_BASE}/CIK{{cik:010d}}.json"
@@ -43,6 +46,28 @@ _FORM_FAMILY_MAP: dict[str, FormFamily] = {
 
 _EX99_NAME_RE = re.compile(r"(?:ex(?:hibit)?[-_]?99|99[-_.]?\d)", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+_ROUTINE_6K_SUBSTRINGS = (
+    "buyback",
+    "buy-back",
+    "buy back",
+    "own shares",
+    "transaction in own shares",
+    "total voting rights",
+    "pdmr",
+    "block listing",
+    "director",
+    "holding(s) in company",
+    "holdings in company",
+    "holding in company",
+)
+
+
+def is_routine_6k(title: str, doc_name: str = "") -> bool:
+    """Return True when a 6-K filing is routine share/governance noise, not results."""
+    raw = f"{title or ''} {doc_name or ''}".lower()
+    normalized = re.sub(r"[_-]+", " ", raw)
+    return any(marker in raw or marker in normalized for marker in _ROUTINE_6K_SUBSTRINGS)
 
 
 def validate_sec_user_agent(user_agent: str) -> str:
@@ -75,11 +100,11 @@ def _is_safe_doc_name(name: str) -> bool:
     return True
 
 
-def _select_6k_exhibit(index_json: dict[str, Any], primary_doc: str) -> str:
-    """Pick an earnings/results EX-99.* exhibit from a 6-K accession `index.json`."""
+def _select_ex99_exhibit(index_json: dict[str, Any], primary_doc: str) -> str | None:
+    """Pick the best EX-99.1 / EX-99.* exhibit from an accession `index.json`, or None."""
     items = index_json.get("directory", {}).get("item", [])
     if not isinstance(items, list):
-        return primary_doc
+        return None
 
     candidates: list[tuple[int, str]] = []
     for item in items:
@@ -109,7 +134,12 @@ def _select_6k_exhibit(index_json: dict[str, Any], primary_doc: str) -> str:
     if candidates:
         candidates.sort(key=lambda pair: (pair[0], pair[1]))
         return candidates[0][1]
-    return primary_doc
+    return None
+
+
+def _select_6k_exhibit(index_json: dict[str, Any], primary_doc: str) -> str:
+    """Pick an earnings/results EX-99.* exhibit from a 6-K accession `index.json`."""
+    return _select_ex99_exhibit(index_json, primary_doc) or primary_doc
 
 
 class SecEdgarAdapter:
@@ -123,12 +153,48 @@ class SecEdgarAdapter:
         timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
         resolver: HostResolver | None = None,
+        store: FilingsStore | None = None,
     ) -> None:
         self._user_agent = validate_sec_user_agent(user_agent)
         self._backfill_years = max(1, backfill_years)
         self._timeout = timeout
         self._transport = transport
         self._resolver = resolver
+        self._store = store
+        self._index_cache: dict[tuple[int, str], dict[str, Any]] = {}
+
+    async def _fetch_accession_index(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        cik: int,
+        accn: str,
+        accn_nodash: str,
+    ) -> dict[str, Any] | None:
+        cache_key = (cik, accn)
+        if cache_key in self._index_cache:
+            return self._index_cache[cache_key]
+        if self._store is not None:
+            cached = self._store.get_sec_index_cache(cik, accn)
+            if cached is not None:
+                self._index_cache[cache_key] = cached
+                return cached
+
+        index_url = validate_public_https_url(
+            f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/index.json",
+            allowed_hosts=SEC_ALLOWED_HOSTS,
+            resolver=self._resolver,
+        )
+        idx_resp = await client.get(index_url)
+        if idx_resp.status_code != 200:
+            return None
+        data = idx_resp.json()
+        if not isinstance(data, dict):
+            return None
+        self._index_cache[cache_key] = data
+        if self._store is not None:
+            self._store.put_sec_index_cache(cik, accn, data)
+        return data
 
     @property
     def user_agent(self) -> str:
@@ -224,14 +290,13 @@ class SecEdgarAdapter:
                     if not fdate or fdate < cutoff:
                         continue
 
+                    item_set: set[str] = set()
                     if form == "8-K":
                         raw_items = items_list[idx] if idx < len(items_list) else []
                         if isinstance(raw_items, str):
                             item_set = {s.strip() for s in raw_items.split(",") if s.strip()}
                         elif isinstance(raw_items, list):
                             item_set = {str(s).strip() for s in raw_items}
-                        else:
-                            item_set = set()
                         if not (item_set & _ALLOWED_8K_ITEMS):
                             continue
 
@@ -243,16 +308,20 @@ class SecEdgarAdapter:
                         continue
                     primary_doc = str(primary_docs[idx]).strip()
                     selected_doc = primary_doc
+                    ex99_doc: str | None = None
 
                     if form == "6-K":
-                        index_url = validate_public_https_url(
-                            f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/index.json",
-                            allowed_hosts=SEC_ALLOWED_HOSTS,
-                            resolver=self._resolver,
+                        index_data = await self._fetch_accession_index(
+                            client, cik=cik, accn=accn, accn_nodash=accn_nodash
                         )
-                        idx_resp = await client.get(index_url)
-                        if idx_resp.status_code == 200:
-                            selected_doc = _select_6k_exhibit(idx_resp.json(), primary_doc)
+                        if index_data is not None:
+                            selected_doc = _select_6k_exhibit(index_data, primary_doc)
+                    elif form == "8-K" and "2.02" in item_set:
+                        index_data = await self._fetch_accession_index(
+                            client, cik=cik, accn=accn, accn_nodash=accn_nodash
+                        )
+                        if index_data is not None:
+                            ex99_doc = _select_ex99_exhibit(index_data, primary_doc)
 
                     if not _is_safe_doc_name(selected_doc):
                         continue
@@ -267,6 +336,10 @@ class SecEdgarAdapter:
                     )
                     is_amendment = form.endswith("/A")
                     base_form = form[:-2] if is_amendment else form
+                    form_family = _FORM_FAMILY_MAP[form]
+                    if form == "6-K" and is_routine_6k(desc, selected_doc):
+                        form_family = FormFamily.CURRENT_REPORT
+
                     try:
                         source_url = validate_public_https_url(
                             f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/{selected_doc}",
@@ -283,7 +356,7 @@ class SecEdgarAdapter:
                             adapter=SourceAdapter.SEC_EDGAR,
                             external_id=f"{accn}:{selected_doc}",
                             form_type=form,
-                            form_family=_FORM_FAMILY_MAP[form],
+                            form_family=form_family,
                             title=desc,
                             filing_date=fdate,
                             period_end=period_end,
@@ -295,6 +368,35 @@ class SecEdgarAdapter:
                             base_form_type=base_form,
                         )
                     )
+
+                    if ex99_doc and _is_safe_doc_name(ex99_doc) and ex99_doc != selected_doc:
+                        try:
+                            ex99_url = validate_public_https_url(
+                                f"{SEC_ARCHIVES_BASE}/{cik}/{accn_nodash}/{ex99_doc}",
+                                allowed_hosts=SEC_ALLOWED_HOSTS,
+                                resolver=self._resolver,
+                            )
+                        except UnsafeUrlError:
+                            ex99_url = ""
+                        if ex99_url:
+                            candidates.append(
+                                FilingCandidate(
+                                    source_key=company.source_key,
+                                    adapter=SourceAdapter.SEC_EDGAR,
+                                    external_id=f"{accn}:{ex99_doc}",
+                                    form_type="8-K EX-99.1",
+                                    form_family=FormFamily.RESULTS_RELEASE,
+                                    title=f"{desc} (Exhibit 99.1)",
+                                    filing_date=fdate,
+                                    period_end=period_end,
+                                    source_url=ex99_url,
+                                    source_mime=_guess_mime(ex99_doc),
+                                    language="en",
+                                    refetchable=True,
+                                    is_amendment=is_amendment,
+                                    base_form_type="8-K",
+                                )
+                            )
 
         return candidates
 

@@ -1,4 +1,4 @@
-"""Tests for v2 targets compatibility, transcript/statements roles, deterministic IR harvest, and gap jobs."""
+"""Tests for v2 targets compatibility, transcript/statements roles, and retired ir_gap_backfill removal."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from pathlib import Path
 import httpx
 
 from filings_library.adapters.earnings_watch import EarningsWatchAdapter
-from filings_library.adapters.issuer_ir import IssuerIrAdapter
 from filings_library.cas import ContentAddressedStore
 from filings_library.extractor.app import ExtractorClient
 from filings_library.models import (
@@ -93,38 +92,7 @@ async def test_targets_client_accepts_schema_v2_and_typed_ir_urls() -> None:
     assert by_id["doc-2"].form_family == FormFamily.FINANCIAL_STATEMENTS
 
 
-async def test_issuer_ir_adapter_harvests_cdn_presentation_and_transcript() -> None:
-    html_body = """
-    <html><body>
-      <a href="https://s2.q4cdn.com/42/fy26-presentation.pdf">FY26 Investor Presentation</a>
-      <a href="https://d1io3yog0oux5.cloudfront.net/acme/q3-transcript.pdf">
-        Q3 2026 Earnings Call Transcript
-      </a>
-      <a href="https://investor.acme.example/about">About Us</a>
-    </body></html>
-    """
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            content=html_body.encode("utf-8"),
-            headers={"content-type": "text/html"},
-        )
-
-    company = CompanyTarget(
-        source_key="acme-corp",
-        ticker="ACME",
-        name="Acme Corp",
-        ir_urls=["https://investor.acme.example/presentations"],
-    )
-    adapter = IssuerIrAdapter(transport=httpx.MockTransport(handler), resolver=_public_resolver)
-    cands = await adapter.discover(company, today=date(2026, 11, 27))
-    families = {c.form_family for c in cands}
-    assert families == {FormFamily.PRESENTATION, FormFamily.TRANSCRIPT}
-    assert all(c.refetchable is False for c in cands)
-
-
-async def test_sync_once_enqueues_deduplicated_ir_gap_job_when_no_docs_found(
+async def test_sync_once_does_not_enqueue_retired_ir_gap_backfill_job(
     tmp_path: Path,
 ) -> None:
     store = FilingsStore(tmp_path / "filings.db")
@@ -176,19 +144,5 @@ async def test_sync_once_enqueues_deduplicated_ir_gap_job_when_no_docs_found(
         url_resolver=_public_resolver,
         today=date(2026, 11, 27),
     )
-    # Second sync must not duplicate the pending gap job.
-    await sync_once(
-        store=store,
-        cas=cas,
-        targets_client=targets,
-        extractor_client=extractor,
-        config=SyncConfig(),
-        url_resolver=_public_resolver,
-        today=date(2026, 11, 27),
-    )
-    job = store.lease_job("researcher-1")
-    assert job is not None
-    assert job["kind"] == "ir_gap_backfill"
-    assert job["payload"]["source_key"] == "gap-issuer"
-    assert store.lease_job("researcher-2") is None
+    assert store.lease_job("researcher-1") is None
     store.close()

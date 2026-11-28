@@ -1,4 +1,4 @@
-"""Structured source adapters for SEC EDGAR, HKEXnews, ESEF XBRL, and Earnings Watch."""
+"""Structured source adapters for SEC EDGAR, HKEXnews, ESEF XBRL, ASX, and Earnings Watch."""
 
 from __future__ import annotations
 

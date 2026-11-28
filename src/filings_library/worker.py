@@ -16,10 +16,10 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from filings_library.adapters import FilingCandidate
-from filings_library.adapters.earnings_watch import EarningsWatchAdapter
+from filings_library.adapters.asx import AsxAdapter
+from filings_library.adapters.earnings_watch import EarningsWatchAdapter, is_direct_audio_url
 from filings_library.adapters.esef_xbrl import EsefXbrlAdapter
 from filings_library.adapters.hkexnews import HkexnewsAdapter
-from filings_library.adapters.issuer_ir import IssuerIrAdapter
 from filings_library.adapters.sec_edgar import SecEdgarAdapter
 from filings_library.cas import ContentAddressedStore, SymlinkRejectedError
 from filings_library.extractor.app import MAX_EXTRACT_BYTES, ExtractorClient
@@ -31,7 +31,7 @@ from filings_library.models import (
     FormFamily,
     SourceAdapter,
 )
-from filings_library.store import DEFAULT_GLOBAL_CAP_BYTES, FilingsStore
+from filings_library.store import DEFAULT_GLOBAL_CAP_BYTES, FilingsStore, canonicalize_source_url
 from filings_library.targets_client import LibraryTargetsClient
 from filings_library.transcribe import (
     ASR_FORM_TYPE,
@@ -42,6 +42,7 @@ from filings_library.transcribe import (
     ssh_parakeet_command,
 )
 from filings_library.url_safety import (
+    ASX_ALLOWED_HOSTS,
     ESEF_ALLOWED_HOSTS,
     HKEX_ALLOWED_HOSTS,
     SEC_ALLOWED_HOSTS,
@@ -57,8 +58,8 @@ _ADAPTER_ALLOWED_HOSTS: dict[SourceAdapter, frozenset[str] | None] = {
     SourceAdapter.SEC_EDGAR: SEC_ALLOWED_HOSTS,
     SourceAdapter.HKEXNEWS: HKEX_ALLOWED_HOSTS,
     SourceAdapter.ESEF_XBRL: ESEF_ALLOWED_HOSTS,
+    SourceAdapter.ASX: ASX_ALLOWED_HOSTS,
     SourceAdapter.EARNINGS_WATCH: None,
-    SourceAdapter.ISSUER_IR: None,
 }
 
 
@@ -326,8 +327,8 @@ async def sync_once(
     sec_adapter: SecEdgarAdapter | None = None,
     hkex_adapter: HkexnewsAdapter | None = None,
     esef_adapter: EsefXbrlAdapter | None = None,
+    asx_adapter: AsxAdapter | None = None,
     earnings_watch_adapter: EarningsWatchAdapter | None = None,
-    issuer_ir_adapter: IssuerIrAdapter | None = None,
     download_transport: httpx.AsyncBaseTransport | None = None,
     url_resolver: HostResolver | None = None,
     transcriber: Callable[[bytes, str], Awaitable[tuple[bytes, ExtractedDocument]]] | None = None,
@@ -347,6 +348,7 @@ async def sync_once(
             backfill_years=cfg.backfill_years,
             transport=download_transport,
             resolver=url_resolver,
+            store=store,
         )
     hkex = hkex_adapter or HkexnewsAdapter(
         backfill_years=cfg.backfill_years,
@@ -358,7 +360,11 @@ async def sync_once(
         transport=download_transport,
         resolver=url_resolver,
     )
-    issuer_ir = issuer_ir_adapter
+    asx = asx_adapter or AsxAdapter(
+        backfill_years=cfg.backfill_years,
+        transport=download_transport,
+        resolver=url_resolver,
+    )
 
     sec_ua = sec.user_agent if sec is not None else cfg.sec_user_agent
 
@@ -368,14 +374,13 @@ async def sync_once(
 
         candidates: list[FilingCandidate] = []
         # Priority order: Earnings Watch hub (verified_documents + ir_assets),
-        # then official regulatory registries (SEC, HKEX, ESEF).
+        # then official regulatory registries (SEC, HKEX, ESEF, ASX).
         adapter_list: list[tuple[str, object]] = [("earnings_watch", ew)]
         if sec is not None:
             adapter_list.append(("sec_edgar", sec))
         adapter_list.append(("hkexnews", hkex))
         adapter_list.append(("esef_xbrl", esef))
-        if issuer_ir is not None and company.ir_urls:
-            adapter_list.append(("issuer_ir", issuer_ir))
+        adapter_list.append(("asx", asx))
 
         for adapter_name, adapter in adapter_list:
             try:
@@ -384,15 +389,9 @@ async def sync_once(
             except Exception as exc:
                 result.errors.append(f"{company.source_key}/{adapter_name}: {exc}")
 
-        if not candidates and store.count_documents_for_issuer(company.source_key) == 0:
-            store.enqueue_job_if_absent(
-                "ir_gap_backfill",
-                {"source_key": company.source_key, "ticker": company.ticker},
-            )
-
-        # Process older filings before amendments so supersession links resolve cleanly.
-        candidates.sort(key=lambda c: (c.is_amendment, c.filing_date, c.external_id))
-
+        # Deduplicate against existing DB entries and canonical URLs within this batch first.
+        pending_candidates: list[FilingCandidate] = []
+        seen_batch_urls: set[str] = set()
         for cand in candidates:
             existing = store.get_document_by_external_id(
                 cand.source_key, cand.adapter, cand.external_id
@@ -400,12 +399,55 @@ async def sync_once(
             if existing is not None:
                 result.documents_skipped_existing += 1
                 continue
+            canon_url = canonicalize_source_url(cand.source_url)
+            if (canon_url and canon_url in seen_batch_urls) or store.has_document_by_url(
+                cand.source_key, cand.source_url
+            ):
+                result.documents_skipped_existing += 1
+                continue
+            if canon_url:
+                seen_batch_urls.add(canon_url)
+            pending_candidates.append(cand)
 
+        # Apply per_issuer_max_docs budget prioritizing non-CURRENT_REPORT filings first
+        # and newest-first within each tier so routine 6-K/8-K spam never starves annual,
+        # quarterly, or results filings.
+        existing_count = store.count_documents_for_issuer(company.source_key)
+        remaining_slots = max(0, cfg.per_issuer_max_docs - existing_count)
+        if len(pending_candidates) > remaining_slots:
+            # Sort non-CURRENT_REPORT newest-first, then CURRENT_REPORT newest-first.
+            non_current = [
+                c for c in pending_candidates if c.form_family != FormFamily.CURRENT_REPORT
+            ]
+            current_reports = [
+                c for c in pending_candidates if c.form_family == FormFamily.CURRENT_REPORT
+            ]
+            non_current.sort(
+                key=lambda c: ("" if c.filing_date == "undated" else c.filing_date, c.external_id),
+                reverse=True,
+            )
+            current_reports.sort(
+                key=lambda c: ("" if c.filing_date == "undated" else c.filing_date, c.external_id),
+                reverse=True,
+            )
+            prioritized = non_current + current_reports
+            selected_candidates = prioritized[:remaining_slots]
+            result.documents_skipped_quota += len(prioritized) - len(selected_candidates)
+        else:
+            selected_candidates = pending_candidates
+
+        # Process the selected batch oldest-first (and base forms before amendments)
+        # so amendment `supersedes_document_id` links still resolve cleanly.
+        selected_candidates.sort(key=lambda c: (c.is_amendment, c.filing_date, c.external_id))
+
+        for cand in selected_candidates:
             if store.count_documents_for_issuer(company.source_key) >= cfg.per_issuer_max_docs:
                 result.documents_skipped_quota += 1
                 continue
 
-            if cand.form_type == "earnings_call_audio_replay":
+            if cand.form_type == "earnings_call_audio_replay" and is_direct_audio_url(
+                cand.source_url
+            ):
                 if store.has_official_transcript(
                     source_key=company.source_key,
                     period_end=cand.period_end,
@@ -428,7 +470,7 @@ async def sync_once(
                     result.transcriptions_queued += 1
                 continue
 
-            if cand.form_type == "webcast_replay":
+            if cand.form_type in {"webcast_replay", "earnings_call_audio_replay"}:
                 doc_id = _make_document_id(cand.source_key, str(cand.adapter), cand.external_id)
                 md_text = f"## {cand.title}\n\nOfficial webcast replay: [{cand.source_url}]({cand.source_url})\n"
                 md_bytes = md_text.encode("utf-8")
@@ -439,7 +481,7 @@ async def sync_once(
                     source_key=cand.source_key,
                     adapter=cand.adapter,
                     external_id=cand.external_id,
-                    form_type=cand.form_type,
+                    form_type="webcast_replay",
                     form_family=FormFamily.WEBCAST,
                     title=cand.title,
                     filing_date=cand.filing_date,
@@ -493,6 +535,11 @@ async def sync_once(
                 )
             except Exception as exc:
                 result.errors.append(f"download {cand.source_url}: {exc}")
+                continue
+
+            raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            if store.has_document_by_sha256(company.source_key, raw_sha256):
+                result.documents_skipped_existing += 1
                 continue
 
             quota = store.check_quota(
