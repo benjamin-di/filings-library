@@ -238,9 +238,17 @@ def _format_ts(seconds: float) -> str:
 
 
 def parse_parakeet_segments(raw_json: bytes) -> list[TranscriptSegment]:
-    """Parse Parakeet worker JSON output into ordered `TranscriptSegment` items."""
+    """Parse Parakeet worker JSON output into ordered `TranscriptSegment` items.
+
+    Supports both the native `local-transcriber` wire format
+    (`{"source": {"kind": "parakeet"}, "transcription": [{"offsets": {"from": ms, "to": ms}, "text": ...}]}`)
+    and generic `{"segments": [{"start": s, "end": s, "text": ...}]}` payloads.
+    """
     data = json.loads(raw_json.decode("utf-8"))
-    items = data.get("segments") if isinstance(data, dict) else data
+    if isinstance(data, dict):
+        items = data.get("transcription") if "transcription" in data else data.get("segments")
+    else:
+        items = data
     if not isinstance(items, list):
         raise TranscriptionError("unexpected parakeet JSON payload")
     segments: list[TranscriptSegment] = []
@@ -250,8 +258,13 @@ def parse_parakeet_segments(raw_json: bytes) -> list[TranscriptSegment]:
         text = " ".join(str(item.get("text") or "").split())
         if not text:
             continue
-        start = float(item.get("start") or 0.0)
-        end = float(item.get("end") or start)
+        offsets = item.get("offsets")
+        if isinstance(offsets, dict):
+            start = float(offsets.get("from") or 0.0) / 1000.0
+            end = float(offsets.get("to") or offsets.get("from") or 0.0) / 1000.0
+        else:
+            start = float(item.get("start") or 0.0)
+            end = float(item.get("end") or start)
         segments.append(TranscriptSegment(start=start, end=end, text=text))
     return segments
 

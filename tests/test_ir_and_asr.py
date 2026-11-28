@@ -62,9 +62,10 @@ assert hdr['model'] == 'parakeet-unified-en-0.6b-int8'
 wav = sys.stdin.buffer.read(hdr['wav_size'])
 assert len(wav) == hdr['wav_size']
 body = json.dumps({
-    'segments': [
-        {'start': 0.0, 'end': 12.5, 'text': 'Welcome to the Q3 2026 earnings call.'},
-        {'start': 315.0, 'end': 328.0, 'text': 'Operating margin expanded to 24.5 percent.'},
+    'source': {'kind': 'parakeet'},
+    'transcription': [
+        {'offsets': {'from': 0, 'to': 12500}, 'text': 'Welcome to the Q3 2026 earnings call.'},
+        {'offsets': {'from': 315000, 'to': 328000}, 'text': 'Operating margin expanded to 24.5 percent.'},
     ]
 }).encode('utf-8')
 resp_hdr = {
