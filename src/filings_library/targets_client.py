@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import time
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from filings_library.models import LibraryTargetsPayload
 MAX_TTL_SECONDS = 60.0
 DEFAULT_TOKEN_ENV = "FILINGS_TARGETS_TOKEN"
 DEFAULT_MAX_ASSET_BYTES = 250 * 1024 * 1024  # 250 MiB
+_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 class HubUnavailableError(RuntimeError):
@@ -147,7 +149,7 @@ class LibraryTargetsClient:
         Enforces bearer authentication, streaming `max_bytes` cap, and no redirects.
         """
         clean_id = (asset_id or "").strip()
-        if not clean_id or "/" in clean_id or "\\" in clean_id or clean_id in {".", ".."}:
+        if not _ASSET_ID_RE.fullmatch(clean_id) or clean_id in {".", ".."}:
             raise ValueError(f"Invalid IR asset_id: {asset_id!r}")
         if max_bytes <= 0:
             raise ValueError(f"max_bytes must be positive, got {max_bytes}")

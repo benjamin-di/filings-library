@@ -545,6 +545,7 @@ async def sync_once(
                         raw_bytes, fetched_mime = await targets_client.download_ir_asset(
                             cand.ir_asset_id,
                             max_bytes=cfg.max_download_bytes,
+                            timeout=cfg.download_timeout,
                         )
                     except Exception as fallback_exc:
                         result.errors.append(

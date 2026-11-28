@@ -27,6 +27,7 @@ ASX_ANNUAL_HTML_URL = "https://www.asx.com.au/asx/v2/statistics/announcements.do
 ASX_WEB_BASE = "https://www.asx.com.au"
 
 _ASX_CODE_RE = re.compile(r"^[A-Z0-9]{1,6}$")
+_ASX_DOC_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _ASX_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
 _ASX_DATE_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
 _ASX_LINK_RE = re.compile(
@@ -259,6 +260,8 @@ class AsxAdapter:
             doc_key = str(item.get("documentKey") or "").strip()
             raw_url = str(item.get("url") or "").strip()
             if not raw_url and doc_key:
+                if not _ASX_DOC_KEY_RE.fullmatch(doc_key) or doc_key in {".", ".."}:
+                    continue
                 raw_url = ASX_MARKIT_FILE_URL.format(document_key=doc_key)
             if not raw_url:
                 continue

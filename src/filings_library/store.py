@@ -275,9 +275,7 @@ class FilingsStore:
                 """
             )
             self._conn.execute("DELETE FROM documents WHERE adapter = 'issuer_ir'")
-            self._conn.execute(
-                "DELETE FROM jobs WHERE kind = 'ir_gap_backfill' AND status = 'pending'"
-            )
+            self._conn.execute("DELETE FROM jobs WHERE kind = 'ir_gap_backfill'")
 
             # 2. Reclassify existing routine SEC 6-K noise rows from results_release
             #    to current_report so they do not pollute or starve financial filings.

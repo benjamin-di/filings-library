@@ -97,6 +97,10 @@ def test_startup_migration_purges_issuer_ir_and_ir_gap_backfill_idempotently(
         """
     )
     store.enqueue_job("ir_gap_backfill", {"source_key": "example-us", "ticker": "EXMP"})
+    leased_job_id = store.enqueue_job(
+        "ir_gap_backfill", {"source_key": "example-us", "ticker": "EXMP2"}
+    )
+    store.conn.execute("UPDATE jobs SET status = 'leased' WHERE id = ?", (leased_job_id,))
     store.enqueue_job("audio_transcribe", {"source_key": "example-us", "external_id": "a1"})
     store.close()
 

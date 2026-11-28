@@ -167,9 +167,13 @@ async def test_sync_once_does_not_fallback_for_non_earnings_watch_or_without_ir_
             return payload
 
         async def download_ir_asset(
-            self, asset_id: str, *, max_bytes: int = 250 * 1024 * 1024
+            self,
+            asset_id: str,
+            *,
+            max_bytes: int = 250 * 1024 * 1024,
+            timeout: float | None = None,
         ) -> tuple[bytes, str]:
-            del max_bytes
+            del max_bytes, timeout
             fallback_called.append(asset_id)
             return b"<html><body>should not be called</body></html>", "text/html"
 
@@ -356,3 +360,50 @@ async def test_targets_client_download_ir_asset_bearer_auth_max_bytes_and_no_red
 
     with pytest.raises(ValueError, match="Invalid IR asset_id"):
         await client.download_ir_asset("../escape", max_bytes=1024)
+
+    with pytest.raises(ValueError, match="Invalid IR asset_id"):
+        await client.download_ir_asset("asset?query=1", max_bytes=1024)
+
+    with pytest.raises(ValueError, match="Invalid IR asset_id"):
+        await client.download_ir_asset("a" * 65, max_bytes=1024)
+
+
+def test_sec_6k_director_financial_results_not_misclassified() -> None:
+    from filings_library.adapters.sec_edgar import is_routine_6k
+
+    assert is_routine_6k("Director/PDMR Shareholding", "pdmr.htm") is True
+    assert is_routine_6k("Change of Director", "board.htm") is True
+    assert is_routine_6k("Board of Directors Approves Q3 2026 Financial Results", "q3.htm") is False
+    assert is_routine_6k("Director Statement on Half-Year Interim Report", "h1.htm") is False
+    assert is_routine_6k("Board of Directors Meeting Notice", "notice.htm") is False
+
+
+@pytest.mark.asyncio
+async def test_asx_rejects_malformed_document_key() -> None:
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "header": "Annual Report 2026",
+                    "documentReleaseDate": "2026-10-15T00:00:00Z",
+                    "documentKey": "../evil?x=1",
+                },
+                {
+                    "header": "Full Year Statutory Accounts 2026",
+                    "documentReleaseDate": "2026-10-16T00:00:00Z",
+                    "documentKey": "2924-02881234-6A1234567",
+                },
+            ]
+        }
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    adapter = AsxAdapter(transport=httpx.MockTransport(handler), resolver=_public_resolver)
+    company = CompanyTarget(
+        source_key="acme-au", ticker="ACME", exchange="XASX", name="Acme AU Ltd"
+    )
+    cands = await adapter.discover(company, today=date(2026, 11, 28))
+    assert len(cands) == 1
+    assert cands[0].external_id == "2924-02881234-6A1234567"

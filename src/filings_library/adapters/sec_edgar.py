@@ -56,10 +56,24 @@ _ROUTINE_6K_SUBSTRINGS = (
     "total voting rights",
     "pdmr",
     "block listing",
-    "director",
+    "director/pdmr",
+    "director shareholding",
+    "change of director",
+    "director dealing",
+    "appointment of director",
+    "resignation of director",
     "holding(s) in company",
     "holdings in company",
     "holding in company",
+)
+
+_FINANCIAL_RESULTS_GUARD_SUBSTRINGS = (
+    "results",
+    "interim report",
+    "half-year",
+    "half year",
+    "financial statements",
+    "earnings",
 )
 
 
@@ -67,6 +81,8 @@ def is_routine_6k(title: str, doc_name: str = "") -> bool:
     """Return True when a 6-K filing is routine share/governance noise, not results."""
     raw = f"{title or ''} {doc_name or ''}".lower()
     normalized = re.sub(r"[_-]+", " ", raw)
+    if any(guard in raw or guard in normalized for guard in _FINANCIAL_RESULTS_GUARD_SUBSTRINGS):
+        return False
     return any(marker in raw or marker in normalized for marker in _ROUTINE_6K_SUBSTRINGS)
 
 
